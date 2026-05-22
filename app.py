@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from config import DOC_TYPE_LABELS, DOC_TYPE_MAP, DOWNLOAD_DIR
 from src.company_search_global import search_company
 from src.filing_fetcher_us import fetch_filing_list, download_filings
-from src.transcript_fetcher import download_transcripts
+from src.transcript_fetcher import download_transcripts, download_presentations
 from src.table_extractor import extract_tables_from_pdf
 from src.excel_writer import write_tables_to_excel
 
@@ -237,7 +237,24 @@ if st.session_state.filing_df is not None and not st.session_state.filing_df.emp
                     files.extend(transcript_files)
                     status_widget.write(f"🎙️ 找到 {len(transcript_files)} 份电话会纪要")
                 else:
-                    status_widget.write("🎙️ 未在Motley Fool找到电话会纪要")
+                    status_widget.write("🎙️ 未找到电话会纪要")
+
+            # Presentation search for 业绩演示材料
+            if "业绩演示材料" in set(selected_df["doc_type"].tolist()):
+                status_widget.write("📊 搜索业绩演示材料...")
+                pres_dir = out_root / "Presentations"
+                pres_files = download_presentations(
+                    ticker, pres_dir,
+                    company_name=company.get("name", ""),
+                    progress_callback=lambda cur, total, msg: status_widget.write(
+                        f"📊 {msg}"
+                    ),
+                )
+                if pres_files:
+                    files.extend(pres_files)
+                    status_widget.write(f"📊 找到 {len(pres_files)} 份演示材料")
+                else:
+                    status_widget.write("📊 未找到演示材料")
 
             status_widget.write("📊 提取表格...")
             all_tables = []
