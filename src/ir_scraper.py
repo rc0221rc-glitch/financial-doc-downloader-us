@@ -126,29 +126,26 @@ def _try_q4_events(ir_domain: str, ticker: str, target_dates: list[str]) -> list
                 url_lower = att_url.lower()
                 title_lower = att_title.lower()
 
-                # Classify attachment
+                # Classify attachment using both title and URL
                 is_presentation = any(kw in title_lower for kw in [
                     "presentation", "slides", "earnings slides",
-                    "earnings presentation",
-                ])
-                is_prepared = any(kw in title_lower for kw in [
-                    "prepared remarks", "prepared remarks",
+                    "earnings presentation", "webcast slides",
+                    "investor deck", "earnings deck",
+                ]) or any(kw in url_lower for kw in [
+                    "slides", "presentation", "deck",
                 ])
 
-                if is_presentation or is_prepared:
-                    doc_type = "presentation" if is_presentation else "transcript"
+                is_transcript = any(kw in title_lower for kw in [
+                    "prepared remarks", "remarks", "transcript",
+                    "conference call", "earnings call",
+                ])
+
+                if is_presentation or is_transcript or att_type == "Presentation":
+                    doc_type = "transcript" if is_transcript else "presentation"
                     results.append({
                         "title": f"{ticker.upper()} {event_title} - {att_title}",
                         "url": att_url,
                         "type": doc_type,
-                        "date": event_date,
-                    })
-                elif att_type == "Presentation":
-                    # Presentation type but title might not match keywords
-                    results.append({
-                        "title": f"{ticker.upper()} {event_title} - {att_title}",
-                        "url": att_url,
-                        "type": "presentation",
                         "date": event_date,
                     })
 
@@ -280,11 +277,12 @@ def _search_ir_for_presentations(ir_url: str, ticker: str, company_name: str) ->
 
     results = []
     queries = [
-        f"site:{domain} presentation earnings PDF",
-        f"site:{domain} quarterly presentation slides",
+        f"site:{domain} earnings presentation slides PDF",
+        f"site:{domain} quarterly earnings slides filetype:pdf",
+        f"site:{domain} investor presentation Q",
     ]
 
-    for query in queries[:2]:
+    for query in queries[:3]:
         try:
             url = f"https://html.duckduckgo.com/html/?q={quote(query)}"
             resp = _session.get(url, timeout=30)

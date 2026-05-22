@@ -3,8 +3,9 @@
 Strategy:
 1. Get exact earnings dates from Yahoo Finance
 2. Construct direct URLs for known transcript sites (Motley Fool, Stock Analysis)
-3. Check URLs with HEAD request; fetch and parse if found
-4. Also scrape Stock Analysis transcript archive page for ticker
+3. Try Q4 Events API for prepared remarks (used by ~30% of public companies)
+4. Scrape Stock Analysis transcript archive page for ticker
+5. DuckDuckGo search fallback for non-US companies
 """
 
 import re
@@ -140,6 +141,148 @@ def _stockanalysis_transcripts(ticker: str) -> list[dict]:
         return []
 
 
+# ---- Q4 Events API for Transcripts ----
+
+def _try_q4_transcripts(ir_domain: str, ticker: str) -> list[dict]:
+    """Try Q4 Inc Events API for prepared remarks / transcripts.
+
+    Returns:
+        [{title, url, source, ticker, quarter}]
+    """
+    results = []
+    url = f"https://{ir_domain}/feed/Event.svc/GetEventList"
+
+    try:
+        resp = _session.get(url, timeout=15)
+        if resp.status_code != 200:
+            return results
+
+        data = resp.json()
+        events = data.get("GetEventListResult", [])
+
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+
+            event_title = ev.get("Title", "")
+            start_date = ev.get("StartDate", "")
+            event_date = ""
+            if start_date:
+                try:
+                    dt = datetime.strptime(start_date[:10], "%m/%d/%Y")
+                    event_date = dt.strftime("%Y%m%d")
+                except ValueError:
+                    pass
+
+            for att in ev.get("Attachments", []):
+                if not isinstance(att, dict):
+                    continue
+
+                att_url = att.get("Url", "")
+                att_title = att.get("Title", "")
+                att_ext = (att.get("Extension", "") or "").upper()
+
+                if not att_url or att_ext != "PDF":
+                    continue
+
+                title_lower = att_title.lower()
+                is_remarks = any(kw in title_lower for kw in [
+                    "prepared remarks", "remarks", "transcript",
+                    "earnings call", "conference call",
+                ])
+
+                if is_remarks:
+                    # Extract quarter from event title
+                    q_match = re.search(r'(Q\d)\s*FY(\d{2})', event_title, re.IGNORECASE)
+                    quarter_str = f"{q_match.group(1)} FY{q_match.group(2)}" if q_match else ""
+
+                    results.append({
+                        "title": f"{ticker.upper()} {event_title} - {att_title}",
+                        "url": att_url,
+                        "source": "IR (Q4)",
+                        "ticker": ticker.upper(),
+                        "quarter": quarter_str,
+                        "date": event_date,
+                        "_is_pdf": True,
+                    })
+
+    except Exception:
+        pass
+
+    return results
+
+
+# ---- DDG Search for Transcripts ----
+
+def _ddg_search_transcripts(domain: str, ticker: str, company_name: str) -> list[dict]:
+    """DuckDuckGo search for earnings call transcripts."""
+    if not domain and not company_name:
+        return []
+
+    results = []
+    search_terms = company_name or ticker
+    queries = [
+        f'site:seekingalpha.com {search_terms} earnings call transcript',
+        f'site:fool.com {search_terms} earnings call transcript',
+        f'{search_terms} earnings call transcript Q',
+    ]
+
+    for query in queries[:2]:
+        try:
+            url = f"https://html.duckduckgo.com/html/?q={quote(query)}"
+            resp = _session.get(url, timeout=30)
+            if resp.status_code != 200:
+                continue
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+            for item in soup.select(".result")[:10]:
+                link = item.select_one(".result__a")
+                if not link or not link.get("href"):
+                    continue
+
+                href = link["href"]
+                real_url = _extract_ddg_url(href)
+                if not real_url:
+                    continue
+
+                title = link.get_text(strip=True)
+                title_lower = title.lower()
+                url_lower = real_url.lower()
+
+                is_transcript = any(kw in title_lower for kw in [
+                    "transcript", "earnings call", "conference call",
+                    "prepared remarks", "q&a",
+                ])
+
+                if is_transcript and not url_lower.endswith(".pdf"):
+                    results.append({
+                        "title": f"{ticker.upper()} {title[:80]}",
+                        "url": real_url,
+                        "source": "Web Search",
+                        "ticker": ticker.upper(),
+                        "quarter": "",
+                    })
+
+            time.sleep(0.5)
+
+        except Exception:
+            continue
+
+    return results
+
+
+def _extract_ddg_url(href: str) -> str:
+    """Extract real URL from DuckDuckGo redirect."""
+    from urllib.parse import parse_qs, urlparse as _urlparse
+    if "duckduckgo.com" not in href.lower():
+        return href
+    parsed = _urlparse(href)
+    params = parse_qs(parsed.query)
+    if "uddg" in params:
+        return params["uddg"][0]
+    return ""
+
+
 # ---- Transcript Finding ----
 
 def find_transcripts(ticker: str, company_name: str, filing_dates: list[str]) -> list[dict]:
@@ -197,12 +340,43 @@ def find_transcripts(ticker: str, company_name: str, filing_dates: list[str]) ->
                     })
                     break  # Found one for this date
 
-    # Step 2: Scrape Stock Analysis archive
+    # Step 2: Try Q4 Events API for prepared remarks
+    # Get company website for IR domain construction
+    company_website = ""
+    try:
+        import yfinance as yf
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        company_website = info.get("website", "")
+    except Exception:
+        pass
+
+    if company_website:
+        from urllib.parse import urlparse
+        parsed = urlparse(company_website)
+        domain = (parsed.netloc or parsed.path).replace("www.", "").strip("/")
+        if domain:
+            ir_domains = [f"investor.{domain}", f"ir.{domain}", f"investor.{ticker.lower()}.com"]
+            for ir_domain in ir_domains:
+                q4_trans = _try_q4_transcripts(ir_domain, ticker)
+                if q4_trans:
+                    for r in q4_trans:
+                        found.append(r)
+                    break  # Found working Q4 endpoint
+
+    # Step 3: Scrape Stock Analysis archive
     sa_results = _stockanalysis_transcripts(ticker)
     for r in sa_results:
         found.append(r)
 
-    # Step 3: Deduplicate by URL
+    # Step 4: DDG search fallback (for non-US / non-SA companies)
+    if not found:
+        ddg_results = _ddg_search_transcripts(
+            domain if company_website else "", ticker, company_name)
+        for r in ddg_results:
+            found.append(r)
+
+    # Step 5: Deduplicate by URL
     seen = set()
     unique = []
     for f in found:
@@ -347,22 +521,53 @@ def download_transcripts(
                 f"[{trans['source']}] {trans['title'][:50]}")
 
         try:
-            text = fetch_transcript(trans["url"])
-            if text and len(text) > 500:
-                safe_title = _sanitize(trans["title"])[:60]
-                source_tag = trans.get("source", "Web").replace(" ", "_")
-                filename = f"{ticker}_{source_tag}_{safe_title}.txt"
-                filepath = output_dir / filename
+            url = trans["url"]
+            is_pdf = url.lower().endswith(".pdf") or trans.get("_is_pdf")
 
-                content = (
-                    f"Title: {trans['title']}\n"
-                    f"Ticker: {trans['ticker']}\n"
-                    f"Source: {trans['source']}\n"
-                    f"URL: {trans['url']}\n"
-                    + "=" * 60 + "\n\n" + text
-                )
-                filepath.write_text(content, encoding="utf-8")
-                downloaded.append(filepath)
+            if is_pdf:
+                # PDF transcript (e.g., Q4 prepared remarks) — download directly
+                resp = _session.get(url, timeout=60, allow_redirects=True)
+                if resp.status_code == 200 and len(resp.content) > 5000:
+                    safe_title = _sanitize(trans["title"])[:60]
+                    source_tag = trans.get("source", "Web").replace(" ", "_")
+                    filename = f"{ticker}_{source_tag}_{safe_title}.pdf"
+                    filepath = output_dir / filename
+                    filepath.write_bytes(resp.content)
+                    downloaded.append(filepath)
+            else:
+                # HTML transcript — fetch and parse text
+                text = fetch_transcript(url)
+                if text and len(text) > 500:
+                    safe_title = _sanitize(trans["title"])[:60]
+                    source_tag = trans.get("source", "Web").replace(" ", "_")
+                    filename = f"{ticker}_{source_tag}_{safe_title}.txt"
+                    filepath = output_dir / filename
+
+                    content = (
+                        f"Title: {trans['title']}\n"
+                        f"Ticker: {trans['ticker']}\n"
+                        f"Source: {trans['source']}\n"
+                        f"URL: {url}\n"
+                        + "=" * 60 + "\n\n" + text
+                    )
+                    filepath.write_text(content, encoding="utf-8")
+                    downloaded.append(filepath)
+                else:
+                    # Could not fetch content — save URL reference
+                    safe_title = _sanitize(trans["title"])[:60]
+                    source_tag = trans.get("source", "Web").replace(" ", "_")
+                    filename = f"{ticker}_{source_tag}_LINK_{safe_title}.txt"
+                    filepath = output_dir / filename
+                    filepath.write_text(
+                        f"Title: {trans['title']}\n"
+                        f"URL: {url}\n"
+                        f"Source: {trans['source']}\n"
+                        f"Ticker: {trans['ticker']}\n"
+                        f"\n(Transcript content could not be auto-extracted. "
+                        f"Please open the URL manually to view.)\n",
+                        encoding="utf-8",
+                    )
+                    downloaded.append(filepath)
         except Exception:
             continue
 
