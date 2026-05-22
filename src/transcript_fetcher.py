@@ -35,17 +35,22 @@ def _company_slug(name: str, ticker: str) -> str:
     Examples: Apple Inc. -> 'apple', Walmart Inc. -> 'walmart'
     """
     name = name.lower()
-    for suffix in [
+    suffixes = [
         " inc.", " inc", " corp.", " corp", " corporation",
         " ltd.", " ltd", " limited", " plc", " ag", " se", " sa",
         " nv", " company", " group", " holdings", " holding",
         " technologies", " technology", " communications",
         " entertainment", " pharmaceuticals", " laboratories",
         " international", " partners", " energy",
-    ]:
-        if name.endswith(suffix):
-            name = name[:-len(suffix)]
-            break
+    ]
+    # Strip all matching suffixes (multiple may apply)
+    changed = True
+    while changed:
+        changed = False
+        for suffix in suffixes:
+            if name.endswith(suffix):
+                name = name[:-len(suffix)]
+                changed = True
     slug = re.sub(r'[^a-z0-9\s]', '', name)
     slug = re.sub(r'\s+', '-', slug.strip())
     return slug
@@ -215,60 +220,83 @@ def _try_q4_transcripts(ir_domain: str, ticker: str) -> list[dict]:
 # ---- DDG Search for Transcripts ----
 
 def _ddg_search_transcripts(domain: str, ticker: str, company_name: str) -> list[dict]:
-    """DuckDuckGo search for earnings call transcripts."""
-    if not domain and not company_name:
+    """DuckDuckGo search for earnings call transcripts across multiple sources."""
+    if not company_name:
         return []
 
     results = []
     search_terms = company_name or ticker
-    queries = [
+    tk = ticker.upper()
+
+    # Phase 1: Broad web search (catches MarketBeat, Investing.com, GuruFocus, etc.)
+    broad_queries = [
+        f'{search_terms} {ticker} earnings call transcript Q',
+        f'{search_terms} quarterly earnings call transcript',
+    ]
+    for query in broad_queries:
+        _do_ddg_transcript_query(query, results, tk)
+        if results:
+            break
+
+    # Phase 2: Site-scoped searches for known quality sources
+    site_queries = [
         f'site:seekingalpha.com {search_terms} earnings call transcript',
         f'site:fool.com {search_terms} earnings call transcript',
-        f'{search_terms} earnings call transcript Q',
+        f'site:marketbeat.com {search_terms} earnings call transcript',
+        f'site:investing.com {search_terms} earnings call transcript',
+        f'site:gurufocus.com {search_terms} {ticker} earnings',
     ]
-
-    for query in queries[:2]:
-        try:
-            url = f"https://html.duckduckgo.com/html/?q={quote(query)}"
-            resp = _session.get(url, timeout=30)
-            if resp.status_code != 200:
-                continue
-
-            soup = BeautifulSoup(resp.text, "html.parser")
-            for item in soup.select(".result")[:10]:
-                link = item.select_one(".result__a")
-                if not link or not link.get("href"):
-                    continue
-
-                href = link["href"]
-                real_url = _extract_ddg_url(href)
-                if not real_url:
-                    continue
-
-                title = link.get_text(strip=True)
-                title_lower = title.lower()
-                url_lower = real_url.lower()
-
-                is_transcript = any(kw in title_lower for kw in [
-                    "transcript", "earnings call", "conference call",
-                    "prepared remarks", "q&a",
-                ])
-
-                if is_transcript and not url_lower.endswith(".pdf"):
-                    results.append({
-                        "title": f"{ticker.upper()} {title[:80]}",
-                        "url": real_url,
-                        "source": "Web Search",
-                        "ticker": ticker.upper(),
-                        "quarter": "",
-                    })
-
-            time.sleep(0.5)
-
-        except Exception:
-            continue
+    for query in site_queries:
+        _do_ddg_transcript_query(query, results, tk)
 
     return results
+
+
+def _do_ddg_transcript_query(query: str, results: list[dict], ticker_label: str):
+    """Execute a single DDG query for transcripts and append matching results."""
+    try:
+        url = f"https://html.duckduckgo.com/html/?q={quote(query)}"
+        resp = _session.get(url, timeout=30)
+        if resp.status_code != 200:
+            return
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for item in soup.select(".result")[:10]:
+            link = item.select_one(".result__a")
+            if not link or not link.get("href"):
+                continue
+
+            href = link["href"]
+            real_url = _extract_ddg_url(href)
+            if not real_url:
+                continue
+
+            title = link.get_text(strip=True)
+            title_lower = title.lower()
+            url_lower = real_url.lower()
+
+            is_transcript = any(kw in title_lower for kw in [
+                "transcript", "earnings call", "conference call",
+                "prepared remarks", "q&a",
+            ])
+            is_earnings = any(kw in title_lower for kw in [
+                "earnings", "quarterly results", "q1", "q2", "q3", "q4",
+                "financial results", "investor call",
+            ])
+
+            if (is_transcript or is_earnings) and not url_lower.endswith(".pdf"):
+                results.append({
+                    "title": f"{ticker_label} {title[:80]}",
+                    "url": real_url,
+                    "source": "Web Search",
+                    "ticker": ticker_label,
+                    "quarter": "",
+                })
+
+        time.sleep(0.5)
+
+    except Exception:
+        pass
 
 
 def _extract_ddg_url(href: str) -> str:
@@ -322,23 +350,27 @@ def find_transcripts(ticker: str, company_name: str, filing_dates: list[str]) ->
         if not company_name:
             company_name = ticker
 
-        # Try ±1 day offsets, primary quarter/year only, first URL pattern
+        # Try ±1 day offsets, primary quarter/year, ALL URL patterns
+        found_for_date = False
         for offset in (0, -1, 1):
+            if found_for_date:
+                break
             var_dt = dt + timedelta(days=offset)
             var_date = var_dt.strftime("%Y%m%d")
             urls = _motley_fool_urls(ticker, company_name, var_date, q, fy)
-            url = urls[0] if urls else ""
-            if url and url not in checked_urls:
-                checked_urls.add(url)
-                if _url_exists(url):
-                    found.append({
-                        "title": f"{ticker.upper()} Q{q} FY{fy} Earnings Call Transcript",
-                        "url": url,
-                        "source": "Motley Fool",
-                        "ticker": ticker.upper(),
-                        "quarter": f"Q{q} FY{fy}",
-                    })
-                    break  # Found one for this date
+            for url in urls:
+                if url and url not in checked_urls:
+                    checked_urls.add(url)
+                    if _url_exists(url):
+                        found.append({
+                            "title": f"{ticker.upper()} Q{q} FY{fy} Earnings Call Transcript",
+                            "url": url,
+                            "source": "Motley Fool",
+                            "ticker": ticker.upper(),
+                            "quarter": f"Q{q} FY{fy}",
+                        })
+                        found_for_date = True
+                        break  # Found one for this date
 
     # Step 2: Try Q4 Events API for prepared remarks
     # Build IR domains from multiple sources (don't rely solely on Yahoo)
