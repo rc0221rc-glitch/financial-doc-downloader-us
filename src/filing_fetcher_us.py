@@ -94,12 +94,8 @@ def fetch_filing_list(
         forms = config.get("forms", [])
         keyword = config.get("keyword", "")
 
-        # 按 form type 过滤
+        # 按 form type 过滤（keyword匹配移到了download_filings阶段）
         type_df = df[df["form"].isin(forms)].copy()
-
-        # 如果有关键词，进一步过滤（用于8-K exhibits）
-        if keyword and not type_df.empty:
-            type_df = type_df[type_df["form"].isin(["8-K", "8-K/A"])].copy()
 
         if not type_df.empty:
             type_df["doc_type"] = doc_type
@@ -155,13 +151,89 @@ def _get_older_filings(cik: str) -> list[dict] | None:
     return all_older
 
 
+def _fetch_index_page(cik: str, acc_no: str) -> str | None:
+    """获取SEC filing index page（列出所有文档的HTML页面）"""
+    cik_clean = cik.lstrip("0")
+    acc_no_dashes = acc_no.replace("-", "")
+    url = (
+        f"https://www.sec.gov/Archives/edgar/data/{cik_clean}"
+        f"/{acc_no_dashes}/{acc_no_dashes}-index.html"
+    )
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = session.get(url, timeout=REQUEST_TIMEOUT)
+            if resp.status_code == 200 and len(resp.content) > 500:
+                return resp.text
+        except Exception:
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(2 * (attempt + 1))
+    return None
+
+
+def _parse_filing_documents(html: str, cik: str, acc_no: str) -> list[dict]:
+    """解析filing index page，提取所有文档（包括exhibits）"""
+    from lxml import html as lhtml
+
+    try:
+        tree = lhtml.fromstring(html)
+    except Exception:
+        return []
+
+    tables = tree.xpath("//table[contains(@class,'tableFile')]")
+    if not tables:
+        return []
+
+    docs = []
+    for table in tables:
+        rows = table.xpath(".//tr")
+        for row in rows:
+            cells = row.xpath(".//td")
+            if len(cells) < 4:
+                continue
+
+            doc_type = cells[3].text_content().strip()
+            description = cells[1].text_content().strip()
+
+            links = cells[2].cssselect("a")
+            if not links:
+                continue
+            filename = links[0].text_content().strip()
+            href = links[0].get("href", "")
+            if not href:
+                continue
+
+            cik_clean = cik.lstrip("0")
+            acc_no_dashes = acc_no.replace("-", "")
+            base_url = (
+                f"https://www.sec.gov/Archives/edgar/data"
+                f"/{cik_clean}/{acc_no_dashes}/"
+            )
+            if href.startswith("http"):
+                url = href
+            else:
+                url = base_url + (href.split("/")[-1] if "/" in href else href)
+
+            docs.append({
+                "type": doc_type,
+                "description": description,
+                "filename": filename,
+                "url": url,
+            })
+
+    return docs
+
+
 def download_filings(
     filing_df: pd.DataFrame,
     output_dir: Path,
     progress_callback=None,
+    keyword_config: dict[str, str] | None = None,
 ) -> list[Path]:
     """
     下载SEC公告文件。
+
+    对于有keyword_config的doc_type，会从filing index page中查找
+    匹配关键词的EX-* exhibit并下载（用于业绩演示材料、电话会纪要等）。
 
     Returns:
         成功下载的文件路径列表
@@ -171,44 +243,114 @@ def download_filings(
     total = len(filing_df)
 
     for idx, (_, row) in enumerate(filing_df.iterrows()):
-        cik = str(row.get("cik", "")).lstrip("0")
+        cik = str(row.get("cik", ""))
         acc = str(row.get("accession_number", ""))
         primary_doc = str(row.get("primary_document", ""))
         form_type = str(row.get("form", ""))
         ticker = str(row.get("ticker", ""))
         date_str = str(row.get("filing_date", ""))[:10]
+        doc_type = str(row.get("doc_type", ""))
+        keyword = keyword_config.get(doc_type, "") if keyword_config else ""
 
-        if not all([cik, acc, primary_doc]):
-            continue
-
-        # SEC 文档URL
         acc_no_dashes = acc.replace("-", "")
-        doc_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_no_dashes}/{primary_doc}"
+        cik_clean = cik.lstrip("0")
 
-        filename = _safe_name(f"{ticker}_{form_type}_{date_str}_{primary_doc.split('/')[-1]}")
-        filepath = output_dir / filename
+        if keyword:
+            # ===== EXHIBIT MODE: 查找匹配关键词的EX-* exhibit =====
+            html = _fetch_index_page(cik, acc)
+            if html:
+                all_docs = _parse_filing_documents(html, cik, acc)
+                pattern = re.compile(keyword, re.IGNORECASE)
+                matching = [
+                    d for d in all_docs
+                    if d["type"].upper().startswith("EX-")
+                    and pattern.search(d["description"])
+                ]
+                for exhibit in matching:
+                    safe_fname = _safe_name(
+                        f"{ticker}_{form_type}_{date_str}"
+                        f"_{exhibit['type']}_{exhibit['filename']}"
+                    )
+                    filepath = output_dir / safe_fname
 
-        if progress_callback:
-            progress_callback(idx, total, filename)
+                    if progress_callback:
+                        progress_callback(idx, total,
+                            f"{ticker} {exhibit['type']}: {exhibit['filename'][:50]}")
 
-        if filepath.exists():
-            downloaded.append(filepath)
-            continue
+                    if filepath.exists():
+                        downloaded.append(filepath)
+                        continue
 
-        for attempt in range(MAX_RETRIES):
-            try:
-                resp = session.get(doc_url, timeout=REQUEST_TIMEOUT)
-                if resp.status_code == 200 and len(resp.content) > 1000:
-                    filepath.write_bytes(resp.content)
-                    downloaded.append(filepath)
-                    break
-            except Exception:
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(2 * (attempt + 1))
+                    for attempt in range(MAX_RETRIES):
+                        try:
+                            resp = session.get(exhibit["url"], timeout=REQUEST_TIMEOUT)
+                            if resp.status_code == 200 and len(resp.content) > 1000:
+                                filepath.write_bytes(resp.content)
+                                downloaded.append(filepath)
+                                break
+                        except Exception:
+                            if attempt < MAX_RETRIES - 1:
+                                time.sleep(2 * (attempt + 1))
 
-        time.sleep(REQUEST_DELAY)
+                    time.sleep(REQUEST_DELAY)
+
+                if not matching and primary_doc:
+                    # 没有匹配的exhibit，回退到主文档
+                    _download_primary(
+                        cik_clean, acc_no_dashes, primary_doc,
+                        ticker, form_type, date_str,
+                        output_dir, downloaded, idx, total, progress_callback,
+                    )
+            elif primary_doc:
+                # index page获取失败，回退
+                _download_primary(
+                    cik_clean, acc_no_dashes, primary_doc,
+                    ticker, form_type, date_str,
+                    output_dir, downloaded, idx, total, progress_callback,
+                )
+        else:
+            # ===== PRIMARY MODE: 下载主文档 =====
+            if not all([cik_clean, acc, primary_doc]):
+                continue
+            _download_primary(
+                cik_clean, acc_no_dashes, primary_doc,
+                ticker, form_type, date_str,
+                output_dir, downloaded, idx, total, progress_callback,
+            )
 
     return downloaded
+
+
+def _download_primary(
+    cik: str, acc_no_dashes: str, primary_doc: str,
+    ticker: str, form_type: str, date_str: str,
+    output_dir: Path, downloaded: list, idx: int, total: int,
+    progress_callback=None,
+):
+    """下载filing主文档（原有逻辑）"""
+    doc_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_no_dashes}/{primary_doc}"
+    filename = _safe_name(f"{ticker}_{form_type}_{date_str}_{primary_doc.split('/')[-1]}")
+    filepath = output_dir / filename
+
+    if progress_callback:
+        progress_callback(idx, total, filename)
+
+    if filepath.exists():
+        downloaded.append(filepath)
+        return
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = session.get(doc_url, timeout=REQUEST_TIMEOUT)
+            if resp.status_code == 200 and len(resp.content) > 1000:
+                filepath.write_bytes(resp.content)
+                downloaded.append(filepath)
+                break
+        except Exception:
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(2 * (attempt + 1))
+
+    time.sleep(REQUEST_DELAY)
 
 
 def _safe_name(name: str) -> str:

@@ -24,8 +24,13 @@ DOC_TYPE_MAP = {
     },
     "业绩演示材料": {
         "forms": ["8-K", "8-K/A", "6-K", "6-K/A"],
-        "keyword": "presentation|slides|deck|conference|investor presentation|earnings call presentation|supplemental",
+        "keyword": r"presentation|slides|deck|investor presentation|earnings call|supplemental",
         "desc": "业绩说明会PPT（报告附件中的演示材料）",
+    },
+    "业绩电话会纪要": {
+        "forms": ["8-K", "8-K/A", "6-K", "6-K/A"],
+        "keyword": r"transcript|prepared remarks|conference call|webcast|earnings call transcript",
+        "desc": "业绩说明会电话会议纪要（报告附件中的Transcript，非所有公司提交）",
     },
 }
 
