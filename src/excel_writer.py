@@ -59,7 +59,7 @@ def _generate_filepath(
     # 防止重名
     counter = 1
     while path.exists():
-        path = output_dir / f"{company_name}_{year}_{doc_type}_{safe_title}_{counter}.xlsx"
+        path = output_dir / f"{company_name}_{year}_{safe_doc_type}_{safe_title}_{counter}.xlsx"
         counter += 1
     return path
 
