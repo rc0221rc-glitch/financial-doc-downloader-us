@@ -150,15 +150,15 @@ def _get_older_filings(cik: str) -> list[dict] | None:
     return all_older
 
 
-def _fetch_filing_exhibits(cik: str, acc_no: str) -> list[dict]:
+def _fetch_filing_exhibits(cik: str, acc_no: str, primary_doc: str = "") -> list[dict]:
     """
     发现filing中的exhibit文档（仅使用 index.json）。
 
     index.json 中每个 item 包含 name, type, size 字段，
-    type 字段可区分 exhibit（EX-*）和主文档。
+    type 字段是MIME类型（不可靠），真正的文档类型需从文件名推断。
 
     Returns:
-        [{type, filename, url, _is_ex}]
+        [{type, exhibit_type, filename, url, _is_ex}]
     """
     import json
 
@@ -199,8 +199,10 @@ def _fetch_filing_exhibits(cik: str, acc_no: str) -> list[dict]:
         ]):
             continue
 
+        ex_type = _extract_exhibit_type(fname, dtype)
         exhibits.append({
             "type": dtype,
+            "exhibit_type": ex_type,
             "filename": fname,
             "url": f"{base_url}/{fname}",
             "_is_ex": _is_exhibit_from_type(dtype, fname),
@@ -223,6 +225,52 @@ def _is_exhibit_from_type(dtype: str, fname: str) -> bool:
     if dtype_upper in ("8-K", "6-K", "10-K", "10-Q", "20-F", "40-F", "S-1", "F-1"):
         return False
     return bool(re.search(r'ex\d+|exhibit|ex-|ex_', fname.lower()))
+
+
+def _extract_exhibit_type(fname: str, dtype: str) -> str:
+    """从文件名推断 exhibit 类型，如 EX-99.1"""
+    import re as _re
+    # ex991 -> EX-99.1, ex101 -> EX-10.1, ex99 -> EX-99
+    m = _re.search(r'ex(\d{1,2})(\d)?(?:\D|$)', fname.lower())
+    if m:
+        base = m.group(1)
+        sub = m.group(2)
+        if sub and sub != '0':
+            return f"EX-{base}.{sub}"
+        return f"EX-{int(base)}"
+    # exhibit99-1, exhibit99_2
+    m = _re.search(r'exhibit[._-]?(\d{1,2})[._-](\d+)', fname.lower())
+    if m:
+        return f"EX-{int(m.group(1))}.{int(m.group(2))}"
+    return dtype if dtype else ""
+    dtype_upper = dtype.upper()
+    if dtype_upper.startswith("EX-"):
+        return True
+    if dtype_upper in ("GRAPHIC", "XML", "PDF", "ZIP"):
+        return False
+    if re.match(r'^\d', dtype_upper):
+        return False
+    if dtype_upper in ("8-K", "6-K", "10-K", "10-Q", "20-F", "40-F", "S-1", "F-1"):
+        return False
+    return bool(re.search(r'ex\d+|exhibit|ex-|ex_', fname.lower()))
+
+
+def _extract_exhibit_type(fname: str, dtype: str) -> str:
+    """从文件名推断 exhibit 类型，如 EX-99.1"""
+    import re as _re
+    # ex991 -> EX-99.1, ex101 -> EX-10.1, ex99 -> EX-99
+    m = _re.search(r'ex(\d{1,2})(\d)?(?:\D|$)', fname.lower())
+    if m:
+        base = m.group(1)
+        sub = m.group(2)
+        if sub and sub != '0':
+            return f"EX-{base}.{sub}"
+        return f"EX-{int(base)}"
+    # exhibit99-1, exhibit99_2
+    m = _re.search(r'exhibit[._-]?(\d{1,2})[._-](\d+)', fname.lower())
+    if m:
+        return f"EX-{int(m.group(1))}.{int(m.group(2))}"
+    return dtype if dtype else ""
 
 
 def download_filings(
@@ -271,15 +319,17 @@ def download_filings(
             exhibits = [d for d in all_exhibits if d["_is_ex"]]
 
             for exhibit in exhibits:
+                ex_label = exhibit.get('exhibit_type', '') or exhibit.get('type', '')
                 safe_fname = _safe_name(
                     f"{ticker}_{form_type}_{date_str}"
-                    f"_{exhibit['type']}_{exhibit['filename']}"
+                    f"_{ex_label}_{exhibit['filename']}"
                 )
                 filepath = output_dir / safe_fname
 
                 if progress_callback:
+                    ex_label = exhibit.get('exhibit_type', '') or exhibit.get('type', '')
                     progress_callback(idx, total,
-                        f"{ticker} {exhibit['type']}: {exhibit['filename'][:50]}")
+                        f"{ticker} {ex_label}: {exhibit['filename'][:50]}")
 
                 if filepath.exists():
                     downloaded.append(filepath)
