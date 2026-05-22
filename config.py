@@ -11,6 +11,8 @@ DOC_TYPE_MAP = {
     "季度/中期报告 (10-Q / 6-K)": {
         "forms": ["10-Q", "10-Q/A", "10-QT", "6-K", "6-K/A"],
         "desc": "美国公司用10-Q，外国公司用6-K",
+        # 6-K内容过滤：只保留包含财报数据的6-K，排除纯公告类
+        "content_filter": r"(?i)(consolidated|balance.sheet|income.statement|statement.of.operations|cash.flow|financial.position|net.income|total.assets|revenue|earnings.per.share|interim.report|quarterly.report|results.of.operations|management.discussion|operating.results|financial.statements|statement.of.comprehensive)",
     },
     "重大事项/业绩发布 (8-K / 6-K)": {
         "forms": ["8-K", "8-K/A", "6-K", "6-K/A"],
@@ -24,12 +26,12 @@ DOC_TYPE_MAP = {
     },
     "业绩演示材料": {
         "forms": ["8-K", "8-K/A", "6-K", "6-K/A"],
-        "keyword": r"presentation|slides|deck|investor presentation|earnings call|supplemental",
+        "keyword": r"presentation|slides|deck|investor presentation|earnings call|supplemental|quarterly earnings|investor deck|earnings slides|conference presentation",
         "desc": "业绩说明会PPT（报告附件中的演示材料）",
     },
     "业绩电话会纪要": {
         "forms": ["8-K", "8-K/A", "6-K", "6-K/A"],
-        "keyword": r"transcript|prepared remarks|conference call|webcast|earnings call transcript",
+        "keyword": r"transcript|prepared remarks|conference call|webcast|earnings call transcript|earnings conference call|call transcript|quarterly conference|investor call",
         "desc": "业绩说明会电话会议纪要（报告附件中的Transcript，非所有公司提交）",
     },
 }

@@ -201,12 +201,19 @@ if st.session_state.filing_df is not None and not st.session_state.filing_df.emp
                 status_widget.write(f"📥 ({cur + 1}/{total}) {fname[:60]}")
 
             keyword_config = {}
+            content_filter_config = {}
             for dt in set(selected_df["doc_type"].tolist()):
                 cfg = DOC_TYPE_MAP.get(dt, {})
                 if "keyword" in cfg:
                     keyword_config[dt] = cfg["keyword"]
+                if "content_filter" in cfg:
+                    content_filter_config[dt] = cfg["content_filter"]
 
-            files = download_filings(selected_df, pdf_dir, dl_prog, keyword_config=keyword_config)
+            files = download_filings(
+                selected_df, pdf_dir, dl_prog,
+                keyword_config=keyword_config,
+                content_filter_config=content_filter_config,
+            )
             status_widget.write(f"✅ 下载完成：{len(files)}/{len(selected_df)} 份文件")
             overall_progress.progress(0.45)
 

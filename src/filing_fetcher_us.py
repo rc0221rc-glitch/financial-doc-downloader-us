@@ -228,12 +228,16 @@ def download_filings(
     output_dir,
     progress_callback=None,
     keyword_config=None,
+    content_filter_config=None,
 ):
     """
     下载SEC公告文件。
 
     对于有keyword_config的doc_type，会从filing index page中查找
     匹配关键词的EX-* exhibit并下载（用于业绩演示材料、电话会纪要等）。
+
+    对于有content_filter_config的doc_type，下载后会检查文件内容是否
+    包含财务关键词，不包含的6-K会被过滤掉。
 
     Returns:
         成功下载的文件路径列表
@@ -251,19 +255,20 @@ def download_filings(
         date_str = str(row.get("filing_date", ""))[:10]
         doc_type = str(row.get("doc_type", ""))
         keyword = keyword_config.get(doc_type, "") if keyword_config else ""
+        content_filter = content_filter_config.get(doc_type, "") if content_filter_config else ""
 
         acc_no_dashes = acc.replace("-", "")
         cik_clean = cik.lstrip("0")
 
         if keyword:
-            # ===== EXHIBIT MODE: 查找匹配关键词的EX-* exhibit =====
+            # ===== EXHIBIT MODE: 查找匹配关键词的 exhibit =====
             html = _fetch_index_page(cik, acc)
             if html:
                 all_docs = _parse_filing_documents(html, cik, acc)
                 pattern = re.compile(keyword, re.IGNORECASE)
                 matching = [
                     d for d in all_docs
-                    if d["type"].upper().startswith("EX-")
+                    if _is_exhibit_type(d, form_type)
                     and pattern.search(d["description"])
                 ]
                 for exhibit in matching:
@@ -312,13 +317,83 @@ def download_filings(
             # ===== PRIMARY MODE: 下载主文档 =====
             if not all([cik_clean, acc, primary_doc]):
                 continue
-            _download_primary(
+
+            filepath = _download_primary(
                 cik_clean, acc_no_dashes, primary_doc,
                 ticker, form_type, date_str,
                 output_dir, downloaded, idx, total, progress_callback,
             )
 
+            # 6-K内容过滤：检查是否包含财务数据
+            if content_filter and filepath and form_type in ("6-K", "6-K/A"):
+                if not _check_financial_content(filepath, content_filter):
+                    try:
+                        filepath.unlink()
+                    except Exception:
+                        pass
+                    if filepath in downloaded:
+                        downloaded.remove(filepath)
+                    if progress_callback:
+                        progress_callback(idx, total,
+                            f"{ticker} 6-K skipped (non-financial)")
+
     return downloaded
+
+
+def _is_exhibit_type(doc: dict, form_type: str) -> bool:
+    """判断文档是否为exhibit（非主文档），6-K的exhibit类型标签可能与8-K不同"""
+    dtype = doc["type"].upper()
+    fname = doc.get("filename", "").lower()
+
+    # 标准EX-*类型
+    if dtype.startswith("EX-"):
+        return True
+
+    # 文件名明显是exhibit
+    import re as _re
+    if _re.search(r'ex(\d+|hibit|-|_)', fname):
+        if dtype != form_type.upper():
+            return True
+
+    # 6-K的exhibit类型标签可能不同
+    if form_type.upper().startswith("6-K"):
+        # 非6-K/6-K/A类型的文档通常都是exhibit
+        if dtype and dtype not in ("6-K", "6-K/A"):
+            return True
+        # 空类型但文件名像exhibit
+        if not dtype and _re.search(r'ex(\d+|hibit|-|_)', fname):
+            return True
+
+    # 8-K的exhibit但文件名明显不同
+    if form_type.upper().startswith("8-K"):
+        if dtype and dtype not in ("8-K", "8-K/A"):
+            if _re.search(r'ex(\d+|hibit|-|_)', fname):
+                return True
+
+    return False
+
+
+def _check_financial_content(filepath: Path, filter_pattern: str) -> bool:
+    """检查下载的HTML/PDF文件是否包含财务关键词"""
+    try:
+        import re as _re
+        pattern = _re.compile(filter_pattern, _re.IGNORECASE)
+
+        if filepath.suffix.lower() in (".htm", ".html", ".xhtml"):
+            text = filepath.read_text(encoding="utf-8", errors="ignore")
+            # 去掉HTML标签，只检查文本内容
+            text = _re.sub(r"<[^>]+>", " ", text)
+            text = _re.sub(r"\s+", " ", text)
+            # 取前50000字符检查
+            return bool(pattern.search(text[:50000]))
+        elif filepath.suffix.lower() == ".pdf":
+            # PDF需要特殊处理，暂时跳过过滤（保留PDF）
+            return True
+        else:
+            # 其他格式保留
+            return True
+    except Exception:
+        return True  # 出错时保留文件
 
 
 def _download_primary(
@@ -337,7 +412,7 @@ def _download_primary(
 
     if filepath.exists():
         downloaded.append(filepath)
-        return
+        return filepath
 
     for attempt in range(MAX_RETRIES):
         try:
@@ -345,12 +420,13 @@ def _download_primary(
             if resp.status_code == 200 and len(resp.content) > 1000:
                 filepath.write_bytes(resp.content)
                 downloaded.append(filepath)
-                break
+                return filepath
         except Exception:
             if attempt < MAX_RETRIES - 1:
                 time.sleep(2 * (attempt + 1))
 
     time.sleep(REQUEST_DELAY)
+    return None
 
 
 def _safe_name(name: str) -> str:
