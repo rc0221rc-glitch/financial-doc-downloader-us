@@ -121,6 +121,9 @@ def _stockanalysis_transcripts(ticker: str) -> list[dict]:
             text = link.get_text(strip=True)
             if not href or not text:
                 continue
+            # Skip the list page itself
+            if href.rstrip("/").endswith("/transcripts"):
+                continue
             full_url = f"https://stockanalysis.com{href}" if href.startswith("/") else href
             # Extract date and quarter from text like "Q2 2026 Earnings Call"
             date_match = re.search(r'(\d{4})', text)
@@ -164,8 +167,8 @@ def find_transcripts(ticker: str, company_name: str, filing_dates: list[str]) ->
     for yd in yf_dates:
         candidate_dates.add(yd["date"])
 
-    # Step 1: Direct Motley Fool URL construction for each candidate date
-    for date_str in sorted(candidate_dates):
+    # Step 1: Direct Motley Fool URL construction (limited attempts for speed)
+    for date_str in sorted(candidate_dates)[:6]:  # max 6 dates
         dt = datetime.strptime(date_str, "%Y%m%d")
         m = dt.month
         q_map = {1: "4", 2: "4", 3: "4", 4: "1", 5: "1", 6: "1",
@@ -176,28 +179,23 @@ def find_transcripts(ticker: str, company_name: str, filing_dates: list[str]) ->
         if not company_name:
             company_name = ticker
 
-        # Try ±2 day offsets
-        for offset in (0, -1, 1, -2, 2):
+        # Try ±1 day offsets, primary quarter/year only, first URL pattern
+        for offset in (0, -1, 1):
             var_dt = dt + timedelta(days=offset)
             var_date = var_dt.strftime("%Y%m%d")
-
-            # Try multiple quarter/year variations
-            for q_var, fy_var in [(q, fy), (str((int(q) % 4) + 1), fy), (q, str(int(fy) + 1))]:
-                urls = _motley_fool_urls(ticker, company_name, var_date, q_var, fy_var)
-                for url in urls:
-                    if url in checked_urls:
-                        continue
-                    checked_urls.add(url)
-
-                    if _url_exists(url):
-                        found.append({
-                            "title": f"{ticker.upper()} Q{q_var} FY{fy_var} Earnings Call Transcript",
-                            "url": url,
-                            "source": "Motley Fool",
-                            "ticker": ticker.upper(),
-                            "quarter": f"Q{q_var} FY{fy_var}",
-                        })
-                        break  # Found one for this date/quarter combo
+            urls = _motley_fool_urls(ticker, company_name, var_date, q, fy)
+            url = urls[0] if urls else ""
+            if url and url not in checked_urls:
+                checked_urls.add(url)
+                if _url_exists(url):
+                    found.append({
+                        "title": f"{ticker.upper()} Q{q} FY{fy} Earnings Call Transcript",
+                        "url": url,
+                        "source": "Motley Fool",
+                        "ticker": ticker.upper(),
+                        "quarter": f"Q{q} FY{fy}",
+                    })
+                    break  # Found one for this date
 
     # Step 2: Scrape Stock Analysis archive
     sa_results = _stockanalysis_transcripts(ticker)
@@ -216,9 +214,10 @@ def find_transcripts(ticker: str, company_name: str, filing_dates: list[str]) ->
 
 
 def _url_exists(url: str) -> bool:
-    """Check if a URL exists (HEAD request)."""
+    """Check if a URL exists (GET with stream to avoid full download)."""
     try:
-        resp = _session.head(url, timeout=15, allow_redirects=True)
+        resp = _session.get(url, timeout=15, allow_redirects=True, stream=True)
+        resp.close()
         return resp.status_code == 200
     except Exception:
         return False
@@ -240,10 +239,12 @@ def fetch_transcript(url: str) -> str | None:
 
         # Try known article body selectors
         selectors = [
-            "div.article-body",         # Motley Fool
-            "div.prose",                # Stock Analysis
-            "div.post-content",         # AlphaStreet, Insider Monkey
-            "div.article-content",      # Benzinga
+            "#transcript-panel-full",                           # Stock Analysis
+            "div.space-y-6.text-base",                         # Stock Analysis (inner)
+            "div.article-body",                                # Motley Fool
+            "div.prose",                                       # Generic
+            "div.post-content",                                # AlphaStreet, Insider Monkey
+            "div.article-content",                             # Benzinga
             "section.article-body",
             "div.transcript-body",
             "div[itemprop='articleBody']",
@@ -259,12 +260,15 @@ def fetch_transcript(url: str) -> str | None:
                 break
 
         if not content_div:
-            # Fallback: find div with Operator mentions (transcript signature)
+            # Fallback: find SMALLEST div with Operator >= 2 (transcript signature)
+            candidates = []
             for div in soup.find_all("div"):
                 text = div.get_text(strip=True)
                 if text.count("Operator") >= 2 and len(text) > 2000:
-                    content_div = div
-                    break
+                    candidates.append((len(text), div))
+            if candidates:
+                candidates.sort(key=lambda x: x[0])
+                content_div = candidates[0][1]
 
         if not content_div:
             return None
