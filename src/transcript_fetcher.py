@@ -226,45 +226,47 @@ def _ddg_search_transcripts(domain: str, ticker: str, company_name: str) -> list
         return []
 
     results = []
+    seen_urls = set()
     tk = ticker.upper()
 
-    # Phase 0: Target recent specific quarters (most likely to find latest)
+    # Build all queries — run EVERYTHING, then deduplicate at the end
     now = datetime.now()
-    recent_quarters = []
-    for i in range(4):  # last 4 quarters
+    all_queries = []
+
+    # Phase 0: Target recent specific quarters
+    for i in range(4):
         q_month = now.month - (i * 3)
         q_year = now.year
         if q_month <= 0:
             q_month += 12
             q_year -= 1
         q_num = ((q_month - 1) // 3) + 1
-        recent_quarters.append(f"Q{q_num} {q_year}")
-    for rq in recent_quarters:
-        _do_ddg_transcript_query(
-            f'{search_terms} {ticker} {rq} earnings call transcript', results, tk)
-    if results:
-        return results
+        all_queries.append(
+            f'{search_terms} {ticker} Q{q_num} {q_year} earnings call transcript')
 
-    # Phase 1: Broad web search (catches MarketBeat, Investing.com, GuruFocus, etc.)
-    broad_queries = [
-        f'{search_terms} {ticker} earnings call transcript Q',
+    # Phase 1: Broad web search
+    all_queries.extend([
+        f'{search_terms} {ticker} earnings call transcript',
         f'{search_terms} quarterly earnings call transcript',
-    ]
-    for query in broad_queries:
-        _do_ddg_transcript_query(query, results, tk)
-        if results:
-            break
+    ])
 
-    # Phase 2: Site-scoped searches for known quality sources
-    site_queries = [
+    # Phase 2: Site-scoped searches
+    all_queries.extend([
         f'site:seekingalpha.com {search_terms} earnings call transcript',
         f'site:fool.com {search_terms} earnings call transcript',
         f'site:marketbeat.com {search_terms} earnings call transcript',
         f'site:investing.com {search_terms} earnings call transcript',
         f'site:gurufocus.com {search_terms} {ticker} earnings',
-    ]
-    for query in site_queries:
-        _do_ddg_transcript_query(query, results, tk)
+    ])
+
+    # Run all queries, deduplicating as we go
+    for query in all_queries:
+        new_results = []
+        _do_ddg_transcript_query(query, new_results, tk)
+        for r in new_results:
+            if r["url"] not in seen_urls:
+                seen_urls.add(r["url"])
+                results.append(r)
 
     return results
 
