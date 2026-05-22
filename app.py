@@ -1,4 +1,4 @@
-"""美股SEC公告下载与表格提取工具 - Streamlit主界面"""
+"""全球上市公司公告下载与表格提取工具 - Streamlit主界面"""
 
 import sys
 import zipfile
@@ -10,13 +10,13 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config import DOC_TYPE_LABELS, DOWNLOAD_DIR
-from src.company_search_us import search_company, get_stock_list
+from src.company_search_global import search_company
 from src.filing_fetcher_us import fetch_filing_list, download_filings
 from src.table_extractor import extract_tables_from_pdf
 from src.excel_writer import write_tables_to_excel
 
 st.set_page_config(
-    page_title="美股SEC公告下载工具",
+    page_title="全球上市公司公告下载",
     page_icon="📄",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -26,7 +26,7 @@ st.set_page_config(
 for key, val in {
     "search_results": [],
     "selected_company": None,
-    "doc_types": ["10-K 年度报告", "10-Q 季度报告"],
+    "doc_types": ["年度报告 (10-K / 20-F)", "季度/中期报告 (10-Q / 6-K)"],
     "date_range": (
         datetime.now().date() - timedelta(days=3 * 365),
         datetime.now().date(),
@@ -42,23 +42,26 @@ for key, val in {
 
 # ==================== 侧边栏 ====================
 with st.sidebar:
-    st.header("⚙️ 关于")
+    st.header("🌍 关于")
     st.markdown("""
-    下载美股上市公司SEC公开文件（10-K、10-Q、8-K等），
-    自动提取表格生成Excel。
+    下载全球上市公司公开披露文件，自动提取表格生成Excel。
 
-    **数据来源：** SEC EDGAR
+    **数据来源：**
+    - **SEC EDGAR**：美国及在美上市外国公司
+    - 包含 10-K、10-Q、8-K、20-F、6-K、S-1、F-1 等
+
+    **搜索范围：** 全球（SEC注册 + Yahoo Finance）
     """)
     st.markdown("---")
-    st.caption("注：业绩电话会议纪要(Transcripts)需第三方API，暂通过8-K业绩发布文件获取相关信息。")
+    st.caption("注：仅在日本等本地上市、未在美国发行ADR的公司，SEC档案可能有限。可尝试搜索公司名查找ADR代码。")
     if st.button("🔄 重置"):
         for k in list(st.session_state.keys()):
             del st.session_state[k]
         st.rerun()
 
 # ==================== 主界面 ====================
-st.title("📄 美股上市公司公告下载与表格提取工具")
-st.caption("数据来源：SEC EDGAR (sec.gov)  |  支持纽交所、纳斯达克上市公司")
+st.title("🌍 全球上市公司公告下载与表格提取工具")
+st.caption("数据来源：SEC EDGAR (sec.gov)  +  Yahoo Finance 全球搜索  |  支持美股及全球SEC注册公司")
 
 # ---------- 步骤一：搜索公司 ----------
 st.header("步骤一：搜索公司")
@@ -66,8 +69,8 @@ st.header("步骤一：搜索公司")
 col1, col2 = st.columns([4, 1])
 with col1:
     query = st.text_input(
-        "输入公司代码或名称",
-        placeholder="例如：AAPL、TSLA 或 Apple、Tesla",
+        "输入公司代码或名称（支持全球公司）",
+        placeholder="例如：AAPL、TSLA、IFNNY、3436.T、Infineon、Sumco、Toyota",
         label_visibility="collapsed",
         key="search_input",
     )
@@ -75,17 +78,19 @@ with col2:
     search_btn = st.button("🔍 搜索", use_container_width=True, type="primary")
 
 if search_btn and query.strip():
-    with st.spinner("搜索中..."):
+    with st.spinner("全球搜索中..."):
         st.session_state.search_results = search_company(query.strip())
     if not st.session_state.search_results:
-        st.warning("未找到匹配的公司，请尝试完整的代码或公司名。")
+        st.warning("未找到匹配的公司。请尝试完整代码或公司英文名。")
 
 if st.session_state.search_results:
-    st.subheader("搜索结果（点击选择）")
+    st.subheader(f"搜索结果（共 {len(st.session_state.search_results)} 个，点击选择）")
     opts = {}
     for r in st.session_state.search_results[:30]:
         cik = r.get("cik", "")
-        label = f"{r['ticker']}  |  {r['name'][:80]}  |  CIK:{cik}"
+        source_tag = "SEC" if r.get("source") == "SEC" else "Yahoo"
+        has_cik = "✓" if cik else "✗"
+        label = f"{r['ticker']}  |  {r['name'][:80]}  |  {r.get('exchange','?')}  |  SEC:{has_cik}"
         opts[label] = r
 
     selected = st.radio("选择公司", list(opts.keys()), label_visibility="collapsed")
@@ -95,51 +100,58 @@ if st.session_state.search_results:
 # ---------- 步骤二 & 三：条件与查询 ----------
 if st.session_state.selected_company:
     company = st.session_state.selected_company
-    st.markdown(f"**已选：** `{company['ticker']}` {company['name'][:100]}（CIK: {company['cik']}）")
+    cik = company.get("cik", "")
+    has_filings = bool(cik)
 
-    st.header("步骤二：选择条件")
+    st.markdown(f"**已选：** `{company['ticker']}` {company['name'][:100]}")
+    if cik:
+        st.caption(f"CIK: {cik} | 来源: {company.get('source','?')} | 交易所: {company.get('exchange','?')}")
+    else:
+        st.warning("⚠️ 该公司未在SEC注册，无法下载SEC文件。请尝试搜索公司名查找其ADR代码（如 Infineon → IFNNY，Toyota → TM）。")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        start_date = st.date_input("开始日期", value=st.session_state.date_range[0])
-    with col2:
-        end_date = st.date_input("结束日期", value=st.session_state.date_range[1])
-    st.session_state.date_range = (start_date, end_date)
+    if has_filings:
+        st.header("步骤二：选择条件")
 
-    st.markdown("**文件类型（可多选）：**")
-    doc_types = []
-    for key, label in DOC_TYPE_LABELS.items():
-        if st.checkbox(f"{key} — {label}", value=key in st.session_state.doc_types, key=f"dt_{key}"):
-            doc_types.append(key)
-    st.session_state.doc_types = doc_types
+        col1, col2 = st.columns(2)
+        with col1:
+            start_date = st.date_input("开始日期", value=st.session_state.date_range[0])
+        with col2:
+            end_date = st.date_input("结束日期", value=st.session_state.date_range[1])
+        st.session_state.date_range = (start_date, end_date)
 
-    st.header("步骤三：查询SEC公告")
-    if st.button("📋 查询公告列表", type="primary", disabled=not doc_types):
-        if not doc_types:
-            st.warning("请至少选择一种文件类型。")
-        else:
-            with st.spinner("正在查询SEC EDGAR..."):
-                cik = company["cik"]
-                ticker = company["ticker"]
-                sd = start_date.strftime("%Y%m%d")
-                ed = end_date.strftime("%Y%m%d")
+        st.markdown("**文件类型（可多选）：**")
+        doc_types = []
+        for key, label in DOC_TYPE_LABELS.items():
+            if st.checkbox(f"{key} — {label}", value=key in st.session_state.doc_types, key=f"dt_{key}"):
+                doc_types.append(key)
+        st.session_state.doc_types = doc_types
 
-                pbar = st.progress(0)
-                stat = st.empty()
+        st.header("步骤三：查询SEC公告")
+        if st.button("📋 查询公告列表", type="primary", disabled=not doc_types):
+            if not doc_types:
+                st.warning("请至少选择一种文件类型。")
+            else:
+                with st.spinner("正在查询SEC EDGAR..."):
+                    ticker = company["ticker"]
+                    sd = start_date.strftime("%Y%m%d")
+                    ed = end_date.strftime("%Y%m%d")
 
-                def on_prog(cur, total, msg=""):
-                    pbar.progress(cur / max(total, 1))
-                    stat.text(msg)
+                    pbar = st.progress(0)
+                    stat = st.empty()
 
-                df = fetch_filing_list(cik, ticker, doc_types, sd, ed, on_prog)
-                st.session_state.filing_df = df
-                pbar.empty()
-                stat.empty()
+                    def on_prog(cur, total, msg=""):
+                        pbar.progress(cur / max(total, 1))
+                        stat.text(msg)
 
-                if df.empty:
-                    st.warning("未找到符合条件的SEC公告。")
-                else:
-                    st.rerun()
+                    df = fetch_filing_list(cik, ticker, doc_types, sd, ed, on_prog)
+                    st.session_state.filing_df = df
+                    pbar.empty()
+                    stat.empty()
+
+                    if df.empty:
+                        st.warning("未找到符合条件的SEC公告。")
+                    else:
+                        st.rerun()
 
 # ---------- 步骤四：选择公告 ----------
 if st.session_state.filing_df is not None and not st.session_state.filing_df.empty:
@@ -163,7 +175,6 @@ if st.session_state.filing_df is not None and not st.session_state.filing_df.emp
         if checked:
             selected_indices.append(i)
 
-    # ---------- 步骤五：下载与提取 ----------
     st.header("步骤五：下载与提取表格")
     if st.button("📥 开始下载并提取表格", type="primary", disabled=not selected_indices):
         selected_df = df.iloc[selected_indices].reset_index(drop=True)
@@ -182,7 +193,6 @@ if st.session_state.filing_df is not None and not st.session_state.filing_df.emp
         overall_progress = st.progress(0)
 
         try:
-            # Phase 1: Download filings
             status_widget.write("📥 下载SEC文件...")
 
             def dl_prog(cur, total, fname):
@@ -190,17 +200,16 @@ if st.session_state.filing_df is not None and not st.session_state.filing_df.emp
                 overall_progress.progress(pct)
                 status_widget.write(f"📥 ({cur + 1}/{total}) {fname[:60]}")
 
-            pdfs = download_filings(selected_df, pdf_dir, dl_prog)
-            status_widget.write(f"✅ 下载完成：{len(pdfs)}/{len(selected_df)} 份文件")
+            files = download_filings(selected_df, pdf_dir, dl_prog)
+            status_widget.write(f"✅ 下载完成：{len(files)}/{len(selected_df)} 份文件")
             overall_progress.progress(0.45)
 
-            # Phase 2: Extract tables from PDFs
-            status_widget.write("📊 提取表格（仅处理PDF文件）...")
+            status_widget.write("📊 提取表格...")
             all_tables = []
-            total_files = len(pdfs)
+            total_files = len(files)
 
-            for j, file_path in enumerate(pdfs):
-                if not file_path.suffix.lower() == ".pdf":
+            for j, file_path in enumerate(files):
+                if file_path.suffix.lower() not in (".pdf", ".htm", ".html", ".xhtml"):
                     continue
                 try:
                     def ext_prog(cur, total):
@@ -212,19 +221,15 @@ if st.session_state.filing_df is not None and not st.session_state.filing_df.emp
                     all_tables.extend(tables)
                     status_widget.write(f"   {file_path.stem[:60]}: {len(tables)} 个表格")
                 except Exception:
-                    status_widget.write(f"   {file_path.stem[:60]}: 跳过（非PDF或提取失败）")
+                    status_widget.write(f"   {file_path.stem[:60]}: 跳过")
 
             status_widget.write(f"✅ 共提取 {len(all_tables)} 个表格")
             overall_progress.progress(0.80)
 
-            # Phase 3: Generate Excel
             if all_tables:
                 status_widget.write("📝 生成Excel文件...")
                 excel_files = write_tables_to_excel(
-                    all_tables,
-                    excel_dir,
-                    ticker,
-                    "SEC_Filings",
+                    all_tables, excel_dir, ticker, "SEC_Filings",
                     str(selected_df.iloc[0].get("filing_date", ""))[:4],
                     "、".join(set(str(x) for x in selected_df["doc_type"].tolist())),
                 )
@@ -235,21 +240,19 @@ if st.session_state.filing_df is not None and not st.session_state.filing_df.emp
                 status_widget.write("⚠️ 未提取到表格")
             overall_progress.progress(0.92)
 
-            # Phase 4: Zip all files
             zip_path = out_root / f"{ticker}_SEC_Filings.zip"
-            all_files = pdfs
-            if all_files:
+            all_downloaded = files
+            if all_downloaded:
                 status_widget.write("📦 打包文件...")
                 with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                    for p in all_files:
+                    for p in all_downloaded:
                         zf.write(p, p.name)
-                status_widget.write(f"✅ 打包完成")
                 st.session_state.download_zip_path = str(zip_path)
 
             overall_progress.progress(1.0)
 
             st.session_state.results = {
-                "file_count": len(pdfs),
+                "file_count": len(files),
                 "table_count": len(all_tables),
                 "excel_count": 1 if st.session_state.download_excel_path else 0,
             }
@@ -312,5 +315,5 @@ if st.session_state.results:
 
 st.markdown("---")
 st.caption(
-    "免责声明：本工具从SEC EDGAR (sec.gov) 获取公开披露信息，仅供学习研究使用。"
+    "免责声明：本工具从SEC EDGAR获取公开披露信息，仅供学习研究使用。"
 )
