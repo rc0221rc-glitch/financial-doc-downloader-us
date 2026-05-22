@@ -362,8 +362,15 @@ def find_presentations(ticker: str, company_name: str = "", target_dates: list[s
         ir_domains_to_try.append(f"investor.{clean}")
         ir_domains_to_try.append(f"ir.{clean}")
         ir_domains_to_try.append(f"investors.{clean}")
-        # Also try ticker-based domain (common for Q4)
-        ir_domains_to_try.append(f"investor.{ticker.lower()}.com")
+    # Always try ticker-based patterns (don't rely solely on Yahoo for domain)
+    tk = ticker.lower()
+    ir_domains_to_try.append(f"investor.{tk}.com")
+    ir_domains_to_try.append(f"ir.{tk}.com")
+    # Also try company name patterns
+    if company_name:
+        name_slug = re.sub(r'[^a-z0-9]', '', company_name.lower())[:20]
+        ir_domains_to_try.append(f"investor.{name_slug}.com")
+        ir_domains_to_try.append(f"ir.{name_slug}.com")
 
     # Deduplicate while preserving order
     seen_domains = set()

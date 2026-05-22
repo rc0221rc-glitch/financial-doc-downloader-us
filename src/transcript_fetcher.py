@@ -341,28 +341,47 @@ def find_transcripts(ticker: str, company_name: str, filing_dates: list[str]) ->
                     break  # Found one for this date
 
     # Step 2: Try Q4 Events API for prepared remarks
-    # Get company website for IR domain construction
+    # Build IR domains from multiple sources (don't rely solely on Yahoo)
+    ir_domains = []
+    # From Yahoo Finance website
     company_website = ""
     try:
         import yfinance as yf
         stock = yf.Ticker(ticker)
         info = stock.info
         company_website = info.get("website", "")
+        if company_website:
+            from urllib.parse import urlparse
+            parsed = urlparse(company_website)
+            domain = (parsed.netloc or parsed.path).replace("www.", "").strip("/")
+            if domain:
+                ir_domains.append(f"investor.{domain}")
+                ir_domains.append(f"ir.{domain}")
     except Exception:
         pass
 
-    if company_website:
-        from urllib.parse import urlparse
-        parsed = urlparse(company_website)
-        domain = (parsed.netloc or parsed.path).replace("www.", "").strip("/")
-        if domain:
-            ir_domains = [f"investor.{domain}", f"ir.{domain}", f"investor.{ticker.lower()}.com"]
-            for ir_domain in ir_domains:
-                q4_trans = _try_q4_transcripts(ir_domain, ticker)
-                if q4_trans:
-                    for r in q4_trans:
-                        found.append(r)
-                    break  # Found working Q4 endpoint
+    # Ticker-based patterns (always try these)
+    tk = ticker.lower()
+    ir_domains.append(f"investor.{tk}.com")
+    ir_domains.append(f"ir.{tk}.com")
+
+    # Company name pattern
+    if company_name:
+        name_slug = re.sub(r'[^a-z0-9]', '', company_name.lower())[:20]
+        ir_domains.append(f"investor.{name_slug}.com")
+        ir_domains.append(f"ir.{name_slug}.com")
+
+    # Try all IR domains until one works
+    seen_ir = set()
+    for ir_domain in ir_domains:
+        if ir_domain in seen_ir:
+            continue
+        seen_ir.add(ir_domain)
+        q4_trans = _try_q4_transcripts(ir_domain, ticker)
+        if q4_trans:
+            for r in q4_trans:
+                found.append(r)
+            break  # Found working Q4 endpoint
 
     # Step 3: Scrape Stock Analysis archive
     sa_results = _stockanalysis_transcripts(ticker)
@@ -371,8 +390,12 @@ def find_transcripts(ticker: str, company_name: str, filing_dates: list[str]) ->
 
     # Step 4: DDG search fallback (for non-US / non-SA companies)
     if not found:
-        ddg_results = _ddg_search_transcripts(
-            domain if company_website else "", ticker, company_name)
+        ddg_domain = ""
+        if company_website:
+            from urllib.parse import urlparse as _up
+            p = _up(company_website)
+            ddg_domain = (p.netloc or p.path).replace("www.", "").strip("/")
+        ddg_results = _ddg_search_transcripts(ddg_domain, ticker, company_name)
         for r in ddg_results:
             found.append(r)
 
@@ -574,25 +597,6 @@ def download_transcripts(
         time.sleep(0.3)
 
     return downloaded
-
-
-def download_presentations(
-    ticker: str,
-    output_dir: Path,
-    progress_callback=None,
-    company_name: str = "",
-) -> list[Path]:
-    """Presentations are primarily obtained from SEC 8-K exhibits.
-    This function is kept for API compatibility but delegates to SEC exhibit download.
-    The SEC exhibit download (in filing_fetcher_us.py) handles EX-99.x files
-    from 8-K/6-K filings, which are the actual earnings presentations.
-
-    Returns:
-        Empty list (presentations come from SEC exhibits)
-    """
-    if progress_callback:
-        progress_callback(0, 1, "Presentations are downloaded from SEC 8-K exhibits")
-    return []
 
 
 def _sanitize(name: str) -> str:
