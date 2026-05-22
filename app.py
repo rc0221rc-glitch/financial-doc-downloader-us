@@ -228,6 +228,7 @@ if st.session_state.filing_df is not None and not st.session_state.filing_df.emp
                 ))
                 transcript_files = download_transcripts(
                     ticker, filing_dates, trans_dir,
+                    company_name=company.get("name", ""),
                     progress_callback=lambda cur, total, msg: status_widget.write(
                         f"🎙️ {msg}"
                     ),
