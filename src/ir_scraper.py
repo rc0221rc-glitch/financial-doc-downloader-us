@@ -90,15 +90,16 @@ def _try_q4_events(ir_domain: str, ticker: str, target_dates: list[str]) -> list
 
             event_title = ev.get("Title", "")
             start_date = ev.get("StartDate", "")
-            # Parse date from format "MM/DD/YYYY HH:MM:SS"
             event_date = ""
             event_dt = None
             if start_date:
-                try:
-                    event_dt = datetime.strptime(start_date[:10], "%m/%d/%Y")
-                    event_date = event_dt.strftime("%Y%m%d")
-                except ValueError:
-                    pass
+                for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m/%d/%y", "%d/%m/%Y"):
+                    try:
+                        event_dt = datetime.strptime(start_date[:10], fmt)
+                        event_date = event_dt.strftime("%Y%m%d")
+                        break
+                    except ValueError:
+                        continue
 
             # Date filter: match within ±3 days if target dates provided
             if target_date_objs is not None and event_dt is not None:
@@ -172,26 +173,47 @@ def _try_ir_urls(domain: str, company_name: str, ticker: str) -> str:
 
     Returns the working IR page URL, or empty string.
     """
-    if not domain:
-        return ""
+    tk = ticker.lower()
+    candidates = []
 
-    # Remove 'www.' for subdomain construction
-    clean_domain = domain.replace("www.", "")
+    if domain:
+        clean_domain = domain.replace("www.", "")
+        candidates.extend([
+            f"https://investor.{clean_domain}",
+            f"https://ir.{clean_domain}",
+            f"https://{clean_domain}/investors",
+            f"https://{clean_domain}/investor-relations",
+            f"https://{clean_domain}/investor",
+            f"https://investors.{clean_domain}",
+        ])
 
-    candidates = [
-        f"https://investor.{clean_domain}",
-        f"https://ir.{clean_domain}",
-        f"https://{clean_domain}/investors",
-        f"https://{clean_domain}/investor-relations",
-        f"https://{clean_domain}/investor",
-        f"https://investors.{clean_domain}",
-    ]
+    # Always try ticker-based patterns (works for many companies)
+    candidates.extend([
+        f"https://investor.{tk}.com",
+        f"https://ir.{tk}.com",
+        f"https://investors.{tk}.com",
+        f"https://{tk}.com/investors",
+        f"https://{tk}.com/investor-relations",
+    ])
 
+    # Try company-name-based patterns
+    if company_name:
+        name_slug = re.sub(r'[^a-z0-9]', '', company_name.lower())[:20]
+        candidates.extend([
+            f"https://investor.{name_slug}.com",
+            f"https://ir.{name_slug}.com",
+        ])
+
+    # Deduplicate while preserving order
+    seen = set()
     for url in candidates:
+        if url in seen:
+            continue
+        seen.add(url)
         try:
             resp = _session.get(url, timeout=15, allow_redirects=True)
             if resp.status_code == 200:
-                return resp.url  # Return resolved URL
+                return resp.url
         except Exception:
             continue
 
@@ -276,52 +298,73 @@ def _search_ir_for_presentations(ir_url: str, ticker: str, company_name: str) ->
         return []
 
     results = []
-    queries = [
+    search_name = company_name or ticker
+
+    # Phase 1: site-scoped search (most targeted)
+    site_queries = [
         f"site:{domain} earnings presentation slides PDF",
         f"site:{domain} quarterly earnings slides filetype:pdf",
         f"site:{domain} investor presentation Q",
     ]
 
-    for query in queries[:3]:
+    for query in site_queries:
         try:
-            url = f"https://html.duckduckgo.com/html/?q={quote(query)}"
-            resp = _session.get(url, timeout=30)
-            if resp.status_code != 200:
-                continue
+            _do_ddg_query(query, results)
+            if results:
+                return results
+        except Exception:
+            continue
 
-            soup = BeautifulSoup(resp.text, "html.parser")
-            for item in soup.select(".result")[:10]:
-                link = item.select_one(".result__a")
-                if not link or not link.get("href"):
-                    continue
+    # Phase 2: broader web search without site: scope (fallback)
+    broad_queries = [
+        f"{search_name} earnings presentation slides filetype:pdf Q",
+        f"{search_name} quarterly investor presentation PDF",
+    ]
 
-                href = link["href"]
-                real_url = _extract_ddg_url(href)
-                if not real_url:
-                    continue
-
-                title = link.get_text(strip=True)
-                url_lower = real_url.lower()
-
-                has_pres = any(kw in url_lower for kw in [
-                    "presentation", "slides", "deck", "earnings",
-                ])
-                is_pdf = url_lower.endswith(".pdf")
-
-                if has_pres or (is_pdf and "quarterly" in title.lower()):
-                    results.append({
-                        "title": title,
-                        "url": real_url,
-                        "type": "presentation",
-                        "date": "",
-                    })
-
-            time.sleep(0.5)
-
+    for query in broad_queries:
+        try:
+            _do_ddg_query(query, results)
         except Exception:
             continue
 
     return results
+
+
+def _do_ddg_query(query: str, results: list[dict]):
+    """Execute a single DDG search and append matching results."""
+    url = f"https://html.duckduckgo.com/html/?q={quote(query)}"
+    resp = _session.get(url, timeout=30)
+    if resp.status_code != 200:
+        return
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    for item in soup.select(".result")[:10]:
+        link = item.select_one(".result__a")
+        if not link or not link.get("href"):
+            continue
+
+        href = link["href"]
+        real_url = _extract_ddg_url(href)
+        if not real_url:
+            continue
+
+        title = link.get_text(strip=True)
+        url_lower = real_url.lower()
+
+        has_pres = any(kw in url_lower for kw in [
+            "presentation", "slides", "deck", "earnings",
+        ])
+        is_pdf = url_lower.endswith(".pdf")
+
+        if has_pres or (is_pdf and "quarterly" in title.lower()):
+            results.append({
+                "title": title,
+                "url": real_url,
+                "type": "presentation",
+                "date": "",
+            })
+
+    time.sleep(0.5)
 
 
 def _extract_ddg_url(href: str) -> str:
@@ -385,34 +428,23 @@ def find_presentations(ticker: str, company_name: str = "", target_dates: list[s
     # Step 2: Find the actual IR page
     ir_url = _try_ir_urls(domain, company_name, ticker)
 
-    # If no IR URL found from domain, try ticker-based patterns
-    if not ir_url:
-        extra_candidates = [
-            f"https://investor.{ticker.lower()}.com",
-            f"https://ir.{ticker.lower()}.com",
-        ]
-        for url in extra_candidates:
-            try:
-                resp = _session.get(url, timeout=15, allow_redirects=True)
-                if resp.status_code == 200:
-                    ir_url = resp.url
-                    break
-            except Exception:
-                continue
-
     # Step 3: Directly scrape IR page for presentation PDFs
     if ir_url:
         scrape_results = _scrape_ir_page(ir_url, ticker)
         all_results.extend(scrape_results)
 
-    # Step 4: DDG search (always run as additional fallback)
-    if ir_url:
-        search_results = _search_ir_for_presentations(ir_url, ticker, company_name)
-        all_results.extend(search_results)
-    elif domain:
-        # Even without IR URL, try site-scoped search on the domain
-        search_results = _search_ir_for_presentations(f"https://{domain}", ticker, company_name)
-        all_results.extend(search_results)
+    # Step 4: DDG search — always run, building search domain from any available info
+    search_domain = ir_url or (f"https://{domain}" if domain else "")
+    if not search_domain:
+        # Last resort: construct a search domain from ticker or company name
+        tk = ticker.lower()
+        if company_name:
+            name_slug = re.sub(r'[^a-z0-9]', '', company_name.lower())[:20]
+            search_domain = f"https://{name_slug}.com"
+        else:
+            search_domain = f"https://{tk}.com"
+    search_results = _search_ir_for_presentations(search_domain, ticker, company_name)
+    all_results.extend(search_results)
 
     # Deduplicate by URL
     seen = set()
