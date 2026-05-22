@@ -224,11 +224,11 @@ def _parse_filing_documents(html: str, cik: str, acc_no: str) -> list[dict]:
 
 
 def download_filings(
-    filing_df: pd.DataFrame,
-    output_dir: Path,
+    filing_df,
+    output_dir,
     progress_callback=None,
-    keyword_config: dict[str, str] | None = None,
-) -> list[Path]:
+    keyword_config=None,
+):
     """
     下载SEC公告文件。
 
