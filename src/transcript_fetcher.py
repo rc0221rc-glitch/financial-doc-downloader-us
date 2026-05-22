@@ -1,9 +1,10 @@
-"""Earnings call transcript & presentation fetcher.
+"""Earnings call transcript fetcher.
 
 Strategy:
-1. Use DuckDuckGo search to find transcript/presentation URLs
-2. Fetch and parse content from multiple sources (Motley Fool, Stock Analysis, etc.)
-3. Save as text files
+1. Get exact earnings dates from Yahoo Finance
+2. Construct direct URLs for known transcript sites (Motley Fool, Stock Analysis)
+3. Check URLs with HEAD request; fetch and parse if found
+4. Also scrape Stock Analysis transcript archive page for ticker
 """
 
 import re
@@ -25,43 +26,89 @@ _session.headers.update({
 })
 _session.timeout = 30
 
-# Known transcript sources (checked in order)
-TRANSCRIPT_SOURCES = [
-    {
-        "name": "Motley Fool",
-        "url_pattern": "fool.com/earnings/call-transcripts/",
-        "article_selector": "div.article-body",
-    },
-    {
-        "name": "Stock Analysis",
-        "url_pattern": "stockanalysis.com/stocks/",
-        "article_selector": "div.prose",
-    },
-    {
-        "name": "Benzinga",
-        "url_pattern": "benzinga.com/",
-        "article_selector": "div.article-content",
-    },
-    {
-        "name": "AlphaStreet",
-        "url_pattern": "alphastreet.com/",
-        "article_selector": "div.post-content",
-    },
-    {
-        "name": "Insider Monkey",
-        "url_pattern": "insidermonkey.com/",
-        "article_selector": "div.article-content",
-    },
-]
+# ---- URL Construction ----
+
+def _company_slug(name: str, ticker: str) -> str:
+    """Generate Motley Fool company slug from company name.
+
+    Examples: Apple Inc. -> 'apple', Walmart Inc. -> 'walmart'
+    """
+    name = name.lower()
+    for suffix in [
+        " inc.", " inc", " corp.", " corp", " corporation",
+        " ltd.", " ltd", " limited", " plc", " ag", " se", " sa",
+        " nv", " company", " group", " holdings", " holding",
+        " technologies", " technology", " communications",
+        " entertainment", " pharmaceuticals", " laboratories",
+        " international", " partners", " energy",
+    ]:
+        if name.endswith(suffix):
+            name = name[:-len(suffix)]
+            break
+    slug = re.sub(r'[^a-z0-9\s]', '', name)
+    slug = re.sub(r'\s+', '-', slug.strip())
+    return slug
 
 
-def _duckduckgo_search(query: str, max_results: int = 10) -> list[dict]:
-    """Search via DuckDuckGo HTML (no JS, no API key needed).
+def _motley_fool_urls(ticker: str, company_name: str, date_str: str, quarter: str, fy: str) -> list[str]:
+    """Construct possible Motley Fool transcript URLs.
+
+    Confirmed pattern: /earnings/call-transcripts/{YYYY}/{MM}/{DD}/{slug}-{ticker}-q{Q}-{FY}-earnings-call-transcript/
+    """
+    slug = _company_slug(company_name, ticker)
+    tk = ticker.lower()
+    y, m, d = date_str[:4], date_str[4:6], date_str[6:8]
+    base = f"https://www.fool.com/earnings/call-transcripts/{y}/{m}/{d}/"
+
+    return [
+        f"{base}{slug}-{tk}-q{quarter}-{fy}-earnings-call-transcript/",
+        f"{base}{slug}-{tk}-q{quarter}-{fy}-earnings-transcript/",
+        f"{base}{tk}-q{quarter}-{fy}-earnings-call-transcript/",
+        f"{base}{tk}-q{quarter}-{fy}-earnings-transcript/",
+    ]
+
+
+# ---- Yahoo Finance Helpers ----
+
+def _get_earnings_info(ticker: str) -> tuple[list[dict], str]:
+    """Get historical earnings dates and company name from Yahoo Finance.
 
     Returns:
-        [{title, url, snippet}]
+        ([{date: 'YYYYMMDD', quarter: 'Q1'-'Q4', fy: '2026'}], company_name)
     """
-    url = f"https://html.duckduckgo.com/html/?q={quote(query)}"
+    results = []
+    name = ""
+    try:
+        import yfinance as yf
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        name = info.get("longName", info.get("shortName", ""))
+
+        # Get earnings dates
+        earnings = stock.earnings_dates
+        if earnings is not None and not earnings.empty:
+            for dt in earnings.index:
+                date_str = dt.strftime("%Y%m%d")
+                month = dt.month
+                # Estimate fiscal quarter from calendar
+                q_map = {1: "4", 2: "4", 3: "4", 4: "1", 5: "1", 6: "1",
+                         7: "2", 8: "2", 9: "2", 10: "3", 11: "3", 12: "3"}
+                q = q_map.get(month, "1")
+                fy = str(dt.year - 1 if month <= 3 else dt.year)
+                results.append({"date": date_str, "quarter": q, "fy": fy})
+    except Exception:
+        pass
+    return results, name
+
+
+# ---- Stock Analysis Scraping ----
+
+def _stockanalysis_transcripts(ticker: str) -> list[dict]:
+    """Scrape Stock Analysis transcript archive for a ticker.
+
+    Stock Analysis has: stockanalysis.com/stocks/{ticker}/transcripts/
+    """
+    url = f"https://stockanalysis.com/stocks/{ticker.lower()}/transcripts/"
     try:
         resp = _session.get(url, timeout=30)
         if resp.status_code != 200:
@@ -69,154 +116,118 @@ def _duckduckgo_search(query: str, max_results: int = 10) -> list[dict]:
 
         soup = BeautifulSoup(resp.text, "html.parser")
         results = []
-        for item in soup.select(".result"):
-            link = item.select_one(".result__a")
-            snippet_el = item.select_one(".result__snippet")
-            if link and link.get("href"):
-                href = link["href"]
-                # DuckDuckGo wraps URLs in redirect, extract real URL
-                real_url = _extract_ddg_url(href)
-                if real_url:
-                    results.append({
-                        "title": link.get_text(strip=True),
-                        "url": real_url,
-                        "snippet": snippet_el.get_text(strip=True) if snippet_el else "",
-                    })
-            if len(results) >= max_results:
-                break
+        for link in soup.select("a[href*='/transcripts/']"):
+            href = link.get("href", "")
+            text = link.get_text(strip=True)
+            if not href or not text:
+                continue
+            full_url = f"https://stockanalysis.com{href}" if href.startswith("/") else href
+            # Extract date and quarter from text like "Q2 2026 Earnings Call"
+            date_match = re.search(r'(\d{4})', text)
+            quarter_match = re.search(r'(Q\d)\s*(\d{4})', text)
+            results.append({
+                "title": f"{ticker.upper()} {text} Transcript",
+                "url": full_url,
+                "source": "Stock Analysis",
+                "ticker": ticker.upper(),
+                "quarter": f"{quarter_match.group(1)} FY{quarter_match.group(2)}" if quarter_match else "",
+            })
         return results
     except Exception:
         return []
 
 
-def _extract_ddg_url(href: str) -> str:
-    """Extract real URL from DuckDuckGo redirect URL."""
-    # DDG HTML version uses uddg= param or direct link
-    from urllib.parse import urlparse, parse_qs
-    if href.startswith("http") and "duckduckgo.com" not in href:
-        return href
-    parsed = urlparse(href)
-    params = parse_qs(parsed.query)
-    if "uddg" in params:
-        return params["uddg"][0]
-    return ""
+# ---- Transcript Finding ----
 
-
-def search_transcripts(ticker: str, company_name: str = "") -> list[dict]:
-    """Search for earnings call transcripts using DuckDuckGo.
+def find_transcripts(ticker: str, company_name: str, filing_dates: list[str]) -> list[dict]:
+    """Find earnings call transcripts using direct URL construction + archive scraping.
 
     Args:
-        ticker: Stock ticker
-        company_name: Full company name (for better search results)
+        ticker: Stock symbol
+        company_name: Full company name
+        filing_dates: SEC filing dates (YYYYMMDD), used as earnings date candidates
 
     Returns:
-        [{title, url, source, date_estimated}]
+        [{title, url, source, ticker, quarter}]
     """
-    all_results = []
+    found = []
+    checked_urls = set()
 
-    # Build search queries
-    company = company_name or ticker
-    queries = [
-        f"{ticker} {company} earnings call transcript",
-        f"{company} Q1 {datetime.now().year} earnings call transcript",
-        f"{ticker} quarterly earnings conference call transcript",
-    ]
+    # Get Yahoo Finance earnings dates if company name is unknown
+    if not company_name:
+        yf_dates, company_name = _get_earnings_info(ticker)
+    else:
+        yf_dates, _ = _get_earnings_info(ticker)
 
-    # Also try current and previous year
-    current_year = datetime.now().year
-    for year in (current_year, current_year - 1):
-        for q in ("Q1", "Q2", "Q3", "Q4"):
-            queries.append(f"{company} {q} {year} earnings call transcript")
+    # Build candidate date list: SEC filings + Yahoo Finance
+    candidate_dates = set(filing_dates) if filing_dates else set()
+    for yd in yf_dates:
+        candidate_dates.add(yd["date"])
 
-    seen_urls = set()
-    for query in queries[:6]:  # Limit to 6 queries
-        results = _duckduckgo_search(query, max_results=10)
-        for r in results:
-            url = r["url"]
-            if url in seen_urls:
-                continue
-            seen_urls.add(url)
+    # Step 1: Direct Motley Fool URL construction for each candidate date
+    for date_str in sorted(candidate_dates):
+        dt = datetime.strptime(date_str, "%Y%m%d")
+        m = dt.month
+        q_map = {1: "4", 2: "4", 3: "4", 4: "1", 5: "1", 6: "1",
+                 7: "2", 8: "2", 9: "2", 10: "3", 11: "3", 12: "3"}
+        q = q_map.get(m, "1")
+        fy = str(dt.year - 1 if m <= 3 else dt.year)
 
-            # Check if URL looks like a transcript
-            url_lower = url.lower()
-            is_transcript = any(kw in url_lower for kw in [
-                "transcript", "earnings-call", "earnings_call",
-                "earningscall", "call-transcript",
-            ])
-            if not is_transcript:
-                # Also check title
-                title_lower = r["title"].lower()
-                is_transcript = any(kw in title_lower for kw in [
-                    "transcript", "earnings call", "earnings conference",
-                ])
+        if not company_name:
+            company_name = ticker
 
-            if is_transcript:
-                # Determine source
-                source = "Web"
-                for src_info in TRANSCRIPT_SOURCES:
-                    if src_info["url_pattern"] in url_lower:
-                        source = src_info["name"]
-                        break
+        # Try ±2 day offsets
+        for offset in (0, -1, 1, -2, 2):
+            var_dt = dt + timedelta(days=offset)
+            var_date = var_dt.strftime("%Y%m%d")
 
-                all_results.append({
-                    "title": r["title"],
-                    "url": url,
-                    "source": source,
-                    "ticker": ticker.upper(),
-                })
+            # Try multiple quarter/year variations
+            for q_var, fy_var in [(q, fy), (str((int(q) % 4) + 1), fy), (q, str(int(fy) + 1))]:
+                urls = _motley_fool_urls(ticker, company_name, var_date, q_var, fy_var)
+                for url in urls:
+                    if url in checked_urls:
+                        continue
+                    checked_urls.add(url)
 
-        time.sleep(0.5)
+                    if _url_exists(url):
+                        found.append({
+                            "title": f"{ticker.upper()} Q{q_var} FY{fy_var} Earnings Call Transcript",
+                            "url": url,
+                            "source": "Motley Fool",
+                            "ticker": ticker.upper(),
+                            "quarter": f"Q{q_var} FY{fy_var}",
+                        })
+                        break  # Found one for this date/quarter combo
 
-    return all_results
+    # Step 2: Scrape Stock Analysis archive
+    sa_results = _stockanalysis_transcripts(ticker)
+    for r in sa_results:
+        found.append(r)
 
+    # Step 3: Deduplicate by URL
+    seen = set()
+    unique = []
+    for f in found:
+        if f["url"] not in seen:
+            seen.add(f["url"])
+            unique.append(f)
 
-def search_presentations(ticker: str, company_name: str = "") -> list[dict]:
-    """Search for earnings presentations using DuckDuckGo.
-
-    Returns:
-        [{title, url, source}]
-    """
-    all_results = []
-    company = company_name or ticker
-    queries = [
-        f"{company} investor presentation pdf",
-        f"{company} earnings presentation slides",
-        f"{ticker} quarterly earnings presentation",
-        f"{company} investor relations earnings slides",
-    ]
-
-    seen_urls = set()
-    for query in queries[:3]:
-        results = _duckduckgo_search(query, max_results=10)
-        for r in results:
-            url = r["url"]
-            if url in seen_urls:
-                continue
-            seen_urls.add(url)
-
-            url_lower = url.lower()
-            title_lower = r["title"].lower()
-            is_presentation = any(kw in url_lower or kw in title_lower for kw in [
-                "presentation", "slides", "deck", "investor",
-                "earnings-slides", "investor-presentation",
-            ])
-            # Must be PDF or point to a presentation page
-            if is_presentation and any(kw in url_lower for kw in [
-                ".pdf", "presentation", "slides", "deck",
-            ]):
-                all_results.append({
-                    "title": r["title"],
-                    "url": url,
-                    "source": "Web",
-                    "ticker": ticker.upper(),
-                })
-        time.sleep(0.5)
-
-    return all_results
+    return unique
 
 
-def fetch_transcript(url: str, source: str = "") -> str | None:
-    """Fetch and parse transcript content from a known source URL.
+def _url_exists(url: str) -> bool:
+    """Check if a URL exists (HEAD request)."""
+    try:
+        resp = _session.head(url, timeout=15, allow_redirects=True)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+# ---- Transcript Fetching ----
+
+def fetch_transcript(url: str) -> str | None:
+    """Fetch and parse transcript content from a URL.
 
     Returns the transcript text, or None if not found.
     """
@@ -227,32 +238,28 @@ def fetch_transcript(url: str, source: str = "") -> str | None:
 
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # Find source-specific selector
-        selector = None
-        for src_info in TRANSCRIPT_SOURCES:
-            if source and src_info["name"] == source:
-                selector = src_info["article_selector"]
-                break
+        # Try known article body selectors
+        selectors = [
+            "div.article-body",         # Motley Fool
+            "div.prose",                # Stock Analysis
+            "div.post-content",         # AlphaStreet, Insider Monkey
+            "div.article-content",      # Benzinga
+            "section.article-body",
+            "div.transcript-body",
+            "div[itemprop='articleBody']",
+            "article",
+            "div.entry-content",
+            "main article",
+        ]
 
         content_div = None
-        if selector:
-            content_div = soup.select_one(selector)
+        for sel in selectors:
+            content_div = soup.select_one(sel)
+            if content_div:
+                break
 
         if not content_div:
-            # Try generic selectors
-            for sel in [
-                "div.article-body", "div.article-content",
-                "section.article-body", "div.transcript-body",
-                "div[itemprop='articleBody']", "div#article-body",
-                "div.prose", "div.post-content", "article",
-                "div.entry-content", "main article",
-            ]:
-                content_div = soup.select_one(sel)
-                if content_div:
-                    break
-
-        if not content_div:
-            # Fallback: find div with Operator mentions (transcript pattern)
+            # Fallback: find div with Operator mentions (transcript signature)
             for div in soup.find_all("div"):
                 text = div.get_text(strip=True)
                 if text.count("Operator") >= 2 and len(text) > 2000:
@@ -267,10 +274,12 @@ def fetch_transcript(url: str, source: str = "") -> str | None:
         for p in content_div.find_all(["p", "div"]):
             text = p.get_text(strip=True)
             if text and len(text) > 30:
-                # Skip navigation, ads, etc.
-                if any(skip in text.lower()[:20] for skip in [
-                    "cookie", "advertisement", "subscribe", "sign up",
-                    "login", "menu", "search", "share this",
+                # Skip nav/ads/cookie notices
+                first_20 = text.lower()[:30]
+                if any(skip in first_20 for skip in [
+                    "cookie", "advertisement", "subscribe",
+                    "sign up", "login", "menu", "search",
+                    "share this article", "read more",
                 ]):
                     continue
                 paragraphs.append(text)
@@ -286,6 +295,8 @@ def fetch_transcript(url: str, source: str = "") -> str | None:
         return None
 
 
+# ---- Main Download Function ----
+
 def download_transcripts(
     ticker: str,
     filing_dates: list[str],
@@ -293,16 +304,16 @@ def download_transcripts(
     progress_callback=None,
     company_name: str = "",
 ) -> list[Path]:
-    """Search and download earnings call transcripts.
+    """Find and download earnings call transcripts.
 
-    Uses DuckDuckGo search to find transcripts from multiple sources.
+    Uses direct URL construction for Motley Fool + Stock Analysis archive.
 
     Args:
         ticker: Stock ticker symbol
-        filing_dates: Filing dates (unused in search mode, kept for API compat)
+        filing_dates: SEC filing dates (YYYYMMDD)
         output_dir: Directory to save transcripts
         progress_callback: Optional (current, total, msg)
-        company_name: Company name for better search results
+        company_name: Full company name for URL construction
 
     Returns:
         List of downloaded file paths
@@ -311,53 +322,47 @@ def download_transcripts(
     downloaded = []
 
     if progress_callback:
-        progress_callback(0, 1, f"Searching the web for {ticker} transcripts...")
+        progress_callback(0, 1, f"Searching transcripts for {ticker}...")
 
-    # Get company name from Yahoo if not provided
+    # Get company name from Yahoo if needed
     if not company_name:
-        try:
-            import yfinance as yf
-            stock = yf.Ticker(ticker)
-            info = stock.info
-            company_name = info.get("longName", info.get("shortName", ""))
-        except Exception:
-            company_name = ticker
+        _, company_name = _get_earnings_info(ticker)
 
-    # Search for transcripts
-    transcripts = search_transcripts(ticker, company_name)
+    # Find transcripts
+    transcripts = find_transcripts(ticker, company_name, filing_dates or [])
 
-    if not transcripts:
+    total = len(transcripts)
+    if total == 0:
         if progress_callback:
             progress_callback(0, 1, f"No transcripts found for {ticker}")
         return downloaded
 
-    total = len(transcripts)
     for i, trans in enumerate(transcripts):
         if progress_callback:
             progress_callback(i, total,
                 f"[{trans['source']}] {trans['title'][:50]}")
 
         try:
-            text = fetch_transcript(trans["url"], trans.get("source", ""))
+            text = fetch_transcript(trans["url"])
             if text and len(text) > 500:
-                safe_title = _sanitize_filename(trans["title"])[:60]
-                source_tag = trans.get("source", "Web")
-                filename = f"{ticker}_{source_tag}_transcript_{safe_title}.txt"
+                safe_title = _sanitize(trans["title"])[:60]
+                source_tag = trans.get("source", "Web").replace(" ", "_")
+                filename = f"{ticker}_{source_tag}_{safe_title}.txt"
                 filepath = output_dir / filename
 
-                content = f"Title: {trans['title']}\n"
-                content += f"Ticker: {trans['ticker']}\n"
-                content += f"Source: {trans['source']}\n"
-                content += f"URL: {trans['url']}\n"
-                content += "=" * 60 + "\n\n"
-                content += text
-
+                content = (
+                    f"Title: {trans['title']}\n"
+                    f"Ticker: {trans['ticker']}\n"
+                    f"Source: {trans['source']}\n"
+                    f"URL: {trans['url']}\n"
+                    + "=" * 60 + "\n\n" + text
+                )
                 filepath.write_text(content, encoding="utf-8")
                 downloaded.append(filepath)
         except Exception:
             continue
 
-        time.sleep(0.5)
+        time.sleep(0.3)
 
     return downloaded
 
@@ -368,75 +373,20 @@ def download_presentations(
     progress_callback=None,
     company_name: str = "",
 ) -> list[Path]:
-    """Search and download earnings presentations from the web.
-
-    Currently saves URLs as text references (PDFs can be downloaded separately).
+    """Presentations are primarily obtained from SEC 8-K exhibits.
+    This function is kept for API compatibility but delegates to SEC exhibit download.
+    The SEC exhibit download (in filing_fetcher_us.py) handles EX-99.x files
+    from 8-K/6-K filings, which are the actual earnings presentations.
 
     Returns:
-        List of downloaded file paths
+        Empty list (presentations come from SEC exhibits)
     """
-    output_dir.mkdir(parents=True, exist_ok=True)
-    downloaded = []
-
     if progress_callback:
-        progress_callback(0, 1, f"Searching the web for {ticker} presentations...")
-
-    if not company_name:
-        try:
-            import yfinance as yf
-            stock = yf.Ticker(ticker)
-            info = stock.info
-            company_name = info.get("longName", info.get("shortName", ""))
-        except Exception:
-            company_name = ticker
-
-    presentations = search_presentations(ticker, company_name)
-
-    if not presentations:
-        if progress_callback:
-            progress_callback(0, 1, f"No presentations found for {ticker}")
-        return downloaded
-
-    total = len(presentations)
-    for i, pres in enumerate(presentations):
-        if progress_callback:
-            progress_callback(i, total,
-                f"[Presentation] {pres['title'][:50]}")
-
-        try:
-            url = pres["url"]
-            # Try to download PDFs directly
-            if url.lower().endswith(".pdf"):
-                resp = _session.get(url, timeout=60, allow_redirects=True)
-                if resp.status_code == 200 and len(resp.content) > 5000:
-                    safe_title = _sanitize_filename(pres["title"])[:60]
-                    filename = f"{ticker}_presentation_{safe_title}.pdf"
-                    filepath = output_dir / filename
-                    filepath.write_bytes(resp.content)
-                    downloaded.append(filepath)
-            else:
-                # Save as URL reference
-                safe_title = _sanitize_filename(pres["title"])[:60]
-                filename = f"{ticker}_presentation_link_{safe_title}.txt"
-                filepath = output_dir / filename
-                filepath.write_text(
-                    f"Title: {pres['title']}\n"
-                    f"URL: {url}\n"
-                    f"Source: {pres['source']}\n"
-                    f"Ticker: {pres['ticker']}\n"
-                    f"\nNote: This is a link reference. Download the presentation from the URL above.\n",
-                    encoding="utf-8",
-                )
-                downloaded.append(filepath)
-        except Exception:
-            continue
-
-        time.sleep(0.5)
-
-    return downloaded
+        progress_callback(0, 1, "Presentations are downloaded from SEC 8-K exhibits")
+    return []
 
 
-def _sanitize_filename(name: str) -> str:
+def _sanitize(name: str) -> str:
     """Clean filename of invalid characters."""
     name = re.sub(r'[<>:"/\\|?*\n\r\t]', "", name)
     return name.strip().strip(".")[:200]
