@@ -221,11 +221,11 @@ def _try_q4_transcripts(ir_domain: str, ticker: str) -> list[dict]:
 
 def _ddg_search_transcripts(domain: str, ticker: str, company_name: str) -> list[dict]:
     """DuckDuckGo search for earnings call transcripts across multiple sources."""
-    if not company_name:
+    search_terms = company_name or ticker
+    if not search_terms:
         return []
 
     results = []
-    search_terms = company_name or ticker
     tk = ticker.upper()
 
     # Phase 1: Broad web search (catches MarketBeat, Investing.com, GuruFocus, etc.)
@@ -420,16 +420,15 @@ def find_transcripts(ticker: str, company_name: str, filing_dates: list[str]) ->
     for r in sa_results:
         found.append(r)
 
-    # Step 4: DDG search fallback (for non-US / non-SA companies)
-    if not found:
-        ddg_domain = ""
-        if company_website:
-            from urllib.parse import urlparse as _up
-            p = _up(company_website)
-            ddg_domain = (p.netloc or p.path).replace("www.", "").strip("/")
-        ddg_results = _ddg_search_transcripts(ddg_domain, ticker, company_name)
-        for r in ddg_results:
-            found.append(r)
+    # Step 4: DDG search — always run for broader coverage
+    ddg_domain = ""
+    if company_website:
+        from urllib.parse import urlparse as _up
+        p = _up(company_website)
+        ddg_domain = (p.netloc or p.path).replace("www.", "").strip("/")
+    ddg_results = _ddg_search_transcripts(ddg_domain, ticker, company_name)
+    for r in ddg_results:
+        found.append(r)
 
     # Step 5: Deduplicate by URL
     seen = set()
@@ -443,11 +442,24 @@ def find_transcripts(ticker: str, company_name: str, filing_dates: list[str]) ->
 
 
 def _url_exists(url: str) -> bool:
-    """Check if a URL exists (GET with stream to avoid full download)."""
+    """Check if a URL exists and actually points to a transcript page.
+
+    Verifies the final URL after redirects contains transcript-related keywords
+    to avoid false positives from redirects to homepages.
+    """
     try:
         resp = _session.get(url, timeout=15, allow_redirects=True, stream=True)
         resp.close()
-        return resp.status_code == 200
+        if resp.status_code != 200:
+            return False
+        # Verify the final URL still looks like a transcript page
+        final_url = resp.url.lower()
+        if "transcript" in final_url:
+            return True
+        # If the URL redirected away from earnings/call-transcripts path, it's not a transcript
+        if "/earnings/call-transcripts/" not in final_url and "/earnings/" not in final_url:
+            return False
+        return True
     except Exception:
         return False
 
