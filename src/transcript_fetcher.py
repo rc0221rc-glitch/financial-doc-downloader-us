@@ -228,6 +228,23 @@ def _ddg_search_transcripts(domain: str, ticker: str, company_name: str) -> list
     results = []
     tk = ticker.upper()
 
+    # Phase 0: Target recent specific quarters (most likely to find latest)
+    now = datetime.now()
+    recent_quarters = []
+    for i in range(4):  # last 4 quarters
+        q_month = now.month - (i * 3)
+        q_year = now.year
+        if q_month <= 0:
+            q_month += 12
+            q_year -= 1
+        q_num = ((q_month - 1) // 3) + 1
+        recent_quarters.append(f"Q{q_num} {q_year}")
+    for rq in recent_quarters:
+        _do_ddg_transcript_query(
+            f'{search_terms} {ticker} {rq} earnings call transcript', results, tk)
+    if results:
+        return results
+
     # Phase 1: Broad web search (catches MarketBeat, Investing.com, GuruFocus, etc.)
     broad_queries = [
         f'{search_terms} {ticker} earnings call transcript Q',
@@ -338,17 +355,26 @@ def find_transcripts(ticker: str, company_name: str, filing_dates: list[str]) ->
     for yd in yf_dates:
         candidate_dates.add(yd["date"])
 
-    # Step 1: Direct Motley Fool URL construction (limited attempts for speed)
-    for date_str in sorted(candidate_dates)[:6]:  # max 6 dates
+    # Build a lookup for Yahoo Finance quarter info (date → {quarter, fy})
+    yf_date_info = {yd["date"]: yd for yd in yf_dates}
+
+    if not company_name:
+        company_name = ticker
+
+    # Step 1: Direct Motley Fool URL construction — try RECENT dates first
+    for date_str in sorted(candidate_dates, reverse=True)[:8]:
         dt = datetime.strptime(date_str, "%Y%m%d")
         m = dt.month
-        q_map = {1: "4", 2: "4", 3: "4", 4: "1", 5: "1", 6: "1",
-                 7: "2", 8: "2", 9: "2", 10: "3", 11: "3", 12: "3"}
-        q = q_map.get(m, "1")
-        fy = str(dt.year - 1 if m <= 3 else dt.year)
 
-        if not company_name:
-            company_name = ticker
+        # Prefer Yahoo Finance's quarter/fy, fall back to month-based estimation
+        yf_info = yf_date_info.get(date_str, {})
+        q = yf_info.get("quarter", "")
+        fy = yf_info.get("fy", "")
+        if not q:
+            q_map = {1: "4", 2: "4", 3: "4", 4: "1", 5: "1", 6: "1",
+                     7: "2", 8: "2", 9: "2", 10: "3", 11: "3", 12: "3"}
+            q = q_map.get(m, "1")
+            fy = str(dt.year - 1 if m <= 3 else dt.year)
 
         # Try ±1 day offsets, primary quarter/year, ALL URL patterns
         found_for_date = False
