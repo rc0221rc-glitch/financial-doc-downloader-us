@@ -454,78 +454,95 @@ def _url_exists(url: str) -> bool:
 
 # ---- Transcript Fetching ----
 
-def fetch_transcript(url: str) -> str | None:
-    """Fetch and parse transcript content from a URL.
+def _extract_transcript_text(html_content: str) -> str | None:
+    """Parse and extract transcript content from HTML.
 
     Returns the transcript text, or None if not found.
     """
-    try:
-        resp = _session.get(url, timeout=30, allow_redirects=True)
-        if resp.status_code != 200:
-            return None
+    soup = BeautifulSoup(html_content, "html.parser")
 
-        soup = BeautifulSoup(resp.text, "html.parser")
+    # Try known article body selectors
+    selectors = [
+        "#transcript-panel-full",                           # Stock Analysis
+        "div.space-y-6.text-base",                         # Stock Analysis (inner)
+        "div.article-body",                                # Motley Fool
+        "div.prose",                                       # Generic
+        "div.post-content",                                # AlphaStreet, Insider Monkey
+        "div.article-content",                             # Benzinga, MarketBeat
+        "section.article-body",
+        "div.transcript-body",
+        "div[itemprop='articleBody']",
+        "article",
+        "div.entry-content",
+        "main article",
+        "div.WYSIWYG",                                     # Investing.com
+        "div.article_wrapper",
+        "div.content-section",
+        "#article_text",
+        "div.article-text",
+        "#content-body",
+    ]
 
-        # Try known article body selectors
-        selectors = [
-            "#transcript-panel-full",                           # Stock Analysis
-            "div.space-y-6.text-base",                         # Stock Analysis (inner)
-            "div.article-body",                                # Motley Fool
-            "div.prose",                                       # Generic
-            "div.post-content",                                # AlphaStreet, Insider Monkey
-            "div.article-content",                             # Benzinga
-            "section.article-body",
-            "div.transcript-body",
-            "div[itemprop='articleBody']",
-            "article",
-            "div.entry-content",
-            "main article",
-        ]
+    content_div = None
+    for sel in selectors:
+        content_div = soup.select_one(sel)
+        if content_div:
+            break
 
-        content_div = None
-        for sel in selectors:
-            content_div = soup.select_one(sel)
-            if content_div:
-                break
+    if not content_div:
+        # Fallback 1: find divs with "Operator" (conference call signature)
+        candidates = []
+        for div in soup.find_all("div"):
+            text = div.get_text(strip=True)
+            if text.count("Operator") >= 2 and len(text) > 2000:
+                candidates.append((len(text), div))
+        if candidates:
+            candidates.sort(key=lambda x: x[0])
+            content_div = candidates[0][1]
 
-        if not content_div:
-            # Fallback: find SMALLEST div with Operator >= 2 (transcript signature)
-            candidates = []
-            for div in soup.find_all("div"):
-                text = div.get_text(strip=True)
-                if text.count("Operator") >= 2 and len(text) > 2000:
-                    candidates.append((len(text), div))
-            if candidates:
-                candidates.sort(key=lambda x: x[0])
-                content_div = candidates[0][1]
+    if not content_div:
+        # Fallback 2: find largest text block with transcript keywords
+        keywords = ["earnings call", "conference call", "transcript",
+                     "ladies and gentlemen", "good morning", "good afternoon",
+                     "welcome to the", "thank you for joining",
+                     "i'd like to", "my name is"]
+        best_div = None
+        best_score = 0
+        for div in soup.find_all(["div", "article", "section"]):
+            text = div.get_text(strip=True)
+            if len(text) < 2000:
+                continue
+            score = sum(1 for kw in keywords if kw in text.lower())
+            if score > best_score:
+                best_score = score
+                best_div = div
+        if best_div and best_score >= 2:
+            content_div = best_div
 
-        if not content_div:
-            return None
-
-        # Extract paragraphs
-        paragraphs = []
-        for p in content_div.find_all(["p", "div"]):
-            text = p.get_text(strip=True)
-            if text and len(text) > 30:
-                # Skip nav/ads/cookie notices
-                first_20 = text.lower()[:30]
-                if any(skip in first_20 for skip in [
-                    "cookie", "advertisement", "subscribe",
-                    "sign up", "login", "menu", "search",
-                    "share this article", "read more",
-                ]):
-                    continue
-                paragraphs.append(text)
-
-        if not paragraphs:
-            text = content_div.get_text(strip=True)
-            if len(text) > 500:
-                paragraphs = [text]
-
-        return "\n\n".join(paragraphs) if paragraphs else None
-
-    except Exception:
+    if not content_div:
         return None
+
+    # Extract paragraphs
+    paragraphs = []
+    for p in content_div.find_all(["p", "div"]):
+        text = p.get_text(strip=True)
+        if text and len(text) > 30:
+            # Skip nav/ads/cookie notices
+            first_20 = text.lower()[:30]
+            if any(skip in first_20 for skip in [
+                "cookie", "advertisement", "subscribe",
+                "sign up", "login", "menu", "search",
+                "share this article", "read more",
+            ]):
+                continue
+            paragraphs.append(text)
+
+    if not paragraphs:
+        text = content_div.get_text(strip=True)
+        if len(text) > 500:
+            paragraphs = [text]
+
+    return "\n\n".join(paragraphs) if paragraphs else None
 
 
 # ---- Main Download Function ----
@@ -590,14 +607,22 @@ def download_transcripts(
                     filepath.write_bytes(resp.content)
                     downloaded.append(filepath)
             else:
-                # HTML transcript — fetch and parse text
-                text = fetch_transcript(url)
+                # HTML transcript — fetch page and try to extract text
+                try:
+                    resp = _session.get(url, timeout=60, allow_redirects=True)
+                    if resp.status_code != 200:
+                        continue
+                    html_content = resp.text
+                except Exception:
+                    continue
+
+                text = _extract_transcript_text(html_content)
+                safe_title = _sanitize(trans["title"])[:60]
+                source_tag = trans.get("source", "Web").replace(" ", "_")
+
                 if text and len(text) > 500:
-                    safe_title = _sanitize(trans["title"])[:60]
-                    source_tag = trans.get("source", "Web").replace(" ", "_")
                     filename = f"{ticker}_{source_tag}_{safe_title}.txt"
                     filepath = output_dir / filename
-
                     content = (
                         f"Title: {trans['title']}\n"
                         f"Ticker: {trans['ticker']}\n"
@@ -608,20 +633,10 @@ def download_transcripts(
                     filepath.write_text(content, encoding="utf-8")
                     downloaded.append(filepath)
                 else:
-                    # Could not fetch content — save URL reference
-                    safe_title = _sanitize(trans["title"])[:60]
-                    source_tag = trans.get("source", "Web").replace(" ", "_")
-                    filename = f"{ticker}_{source_tag}_LINK_{safe_title}.txt"
+                    # Text extraction failed — save full HTML page for browser viewing
+                    filename = f"{ticker}_{source_tag}_{safe_title}.html"
                     filepath = output_dir / filename
-                    filepath.write_text(
-                        f"Title: {trans['title']}\n"
-                        f"URL: {url}\n"
-                        f"Source: {trans['source']}\n"
-                        f"Ticker: {trans['ticker']}\n"
-                        f"\n(Transcript content could not be auto-extracted. "
-                        f"Please open the URL manually to view.)\n",
-                        encoding="utf-8",
-                    )
+                    filepath.write_text(html_content, encoding="utf-8")
                     downloaded.append(filepath)
         except Exception:
             continue
