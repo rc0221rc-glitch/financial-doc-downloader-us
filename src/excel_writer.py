@@ -52,7 +52,8 @@ def _generate_filepath(
 ) -> Path:
     """生成智能文件名"""
     safe_title = _sanitize(title or "表格")[:60]
-    base = f"{company_name}_{year}_{doc_type}_{safe_title}.xlsx"
+    safe_doc_type = _sanitize(doc_type)[:40]
+    base = f"{company_name}_{year}_{safe_doc_type}_{safe_title}.xlsx"
     path = output_dir / base
 
     # 防止重名
