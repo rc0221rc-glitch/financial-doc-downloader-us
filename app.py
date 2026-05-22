@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from config import DOC_TYPE_LABELS, DOC_TYPE_MAP, DOWNLOAD_DIR
 from src.company_search_global import search_company
 from src.filing_fetcher_us import fetch_filing_list, download_filings
+from src.transcript_fetcher import download_transcripts
 from src.table_extractor import extract_tables_from_pdf
 from src.excel_writer import write_tables_to_excel
 
@@ -216,6 +217,26 @@ if st.session_state.filing_df is not None and not st.session_state.filing_df.emp
             )
             status_widget.write(f"✅ 下载完成：{len(files)}/{len(selected_df)} 份文件")
             overall_progress.progress(0.45)
+
+            # Transcript search
+            transcript_files = []
+            if "业绩电话会纪要" in set(selected_df["doc_type"].tolist()):
+                status_widget.write("🎙️ 搜索业绩电话会纪要...")
+                trans_dir = out_root / "Transcripts"
+                filing_dates = sorted(set(
+                    str(d)[:10].replace("-", "") for d in selected_df["filing_date"]
+                ))
+                transcript_files = download_transcripts(
+                    ticker, filing_dates, trans_dir,
+                    progress_callback=lambda cur, total, msg: status_widget.write(
+                        f"🎙️ {msg}"
+                    ),
+                )
+                if transcript_files:
+                    files.extend(transcript_files)
+                    status_widget.write(f"🎙️ 找到 {len(transcript_files)} 份电话会纪要")
+                else:
+                    status_widget.write("🎙️ 未在Motley Fool找到电话会纪要")
 
             status_widget.write("📊 提取表格...")
             all_tables = []

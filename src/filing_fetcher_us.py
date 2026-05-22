@@ -92,7 +92,6 @@ def fetch_filing_list(
 
         config = DOC_TYPE_MAP.get(doc_type, {})
         forms = config.get("forms", [])
-        keyword = config.get("keyword", "")
 
         # 按 form type 过滤（keyword匹配移到了download_filings阶段）
         type_df = df[df["form"].isin(forms)].copy()
@@ -151,76 +150,79 @@ def _get_older_filings(cik: str) -> list[dict] | None:
     return all_older
 
 
-def _fetch_index_page(cik: str, acc_no: str) -> str | None:
-    """获取SEC filing index page（列出所有文档的HTML页面）"""
+def _fetch_filing_exhibits(cik: str, acc_no: str) -> list[dict]:
+    """
+    发现filing中的exhibit文档（仅使用 index.json）。
+
+    index.json 中每个 item 包含 name, type, size 字段，
+    type 字段可区分 exhibit（EX-*）和主文档。
+
+    Returns:
+        [{type, filename, url, _is_ex}]
+    """
+    import json
+
     cik_clean = cik.lstrip("0")
     acc_no_dashes = acc_no.replace("-", "")
-    url = (
-        f"https://www.sec.gov/Archives/edgar/data/{cik_clean}"
-        f"/{acc_no_dashes}/{acc_no_dashes}-index.html"
+    base_url = (
+        f"https://www.sec.gov/Archives/edgar/data"
+        f"/{cik_clean}/{acc_no_dashes}"
     )
-    for attempt in range(MAX_RETRIES):
-        try:
-            resp = session.get(url, timeout=REQUEST_TIMEOUT)
-            if resp.status_code == 200 and len(resp.content) > 500:
-                return resp.text
-        except Exception:
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(2 * (attempt + 1))
-    return None
 
-
-def _parse_filing_documents(html: str, cik: str, acc_no: str) -> list[dict]:
-    """解析filing index page，提取所有文档（包括exhibits）"""
-    from lxml import html as lhtml
-
+    json_url = f"{base_url}/index.json"
+    all_items = []
     try:
-        tree = lhtml.fromstring(html)
+        resp = session.get(json_url, timeout=REQUEST_TIMEOUT)
+        if resp.status_code == 200:
+            data = json.loads(resp.text)
+            all_items = data.get("directory", {}).get("item", [])
     except Exception:
+        pass
+
+    if not all_items:
         return []
 
-    tables = tree.xpath("//table[contains(@class,'tableFile')]")
-    if not tables:
-        return []
+    exhibits = []
+    for item in all_items:
+        fname = item.get("name", "")
+        dtype = item.get("type", "")
+        if not fname:
+            continue
 
-    docs = []
-    for table in tables:
-        rows = table.xpath(".//tr")
-        for row in rows:
-            cells = row.xpath(".//td")
-            if len(cells) < 4:
-                continue
+        fname_lower = fname.lower()
 
-            doc_type = cells[3].text_content().strip()
-            description = cells[1].text_content().strip()
+        if any(skip in fname_lower for skip in [
+            "-index.", "-index-headers.", ".xsd", "_def.xml",
+            "_lab.xml", "_pre.xml", "_cal.xml", "FilingSummary.xml",
+            "MetaLinks.json", "Show.js", "report.css", "R1.htm",
+            ".xbrl.zip", "idea", ".gif", ".jpg", ".jpeg", ".png",
+        ]):
+            continue
 
-            links = cells[2].cssselect("a")
-            if not links:
-                continue
-            filename = links[0].text_content().strip()
-            href = links[0].get("href", "")
-            if not href:
-                continue
+        exhibits.append({
+            "type": dtype,
+            "filename": fname,
+            "url": f"{base_url}/{fname}",
+            "_is_ex": _is_exhibit_from_type(dtype, fname),
+        })
 
-            cik_clean = cik.lstrip("0")
-            acc_no_dashes = acc_no.replace("-", "")
-            base_url = (
-                f"https://www.sec.gov/Archives/edgar/data"
-                f"/{cik_clean}/{acc_no_dashes}/"
-            )
-            if href.startswith("http"):
-                url = href
-            else:
-                url = base_url + (href.split("/")[-1] if "/" in href else href)
+    return exhibits
 
-            docs.append({
-                "type": doc_type,
-                "description": description,
-                "filename": filename,
-                "url": url,
-            })
 
-    return docs
+def _is_exhibit_from_type(dtype: str, fname: str) -> bool:
+    """判断 index.json 中的条目是否为 exhibit（非主文档、非 XBRL）"""
+    if not dtype:
+        return bool(re.search(r'ex\d+|exhibit|ex-|ex_', fname.lower()))
+    dtype_upper = dtype.upper()
+    if dtype_upper.startswith("EX-"):
+        return True
+    if dtype_upper in ("GRAPHIC", "XML", "PDF", "ZIP"):
+        return False
+    if re.match(r'^\d', dtype_upper):
+        return False
+    if dtype_upper in ("8-K", "6-K", "10-K", "10-Q", "20-F", "40-F", "S-1", "F-1"):
+        return False
+    return bool(re.search(r'ex\d+|exhibit|ex-|ex_', fname.lower()))
 
 
 def download_filings(
@@ -233,8 +235,9 @@ def download_filings(
     """
     下载SEC公告文件。
 
-    对于有keyword_config的doc_type，会从filing index page中查找
-    匹配关键词的EX-* exhibit并下载（用于业绩演示材料、电话会纪要等）。
+    对于有keyword_config的doc_type，会下载该filing中所有exhibit文档
+    （因为SEC的exhibit描述不包含语义信息，无法通过关键词筛选）。
+    如果没有找到exhibit，则回退到下载主文档。
 
     对于有content_filter_config的doc_type，下载后会检查文件内容是否
     包含财务关键词，不包含的6-K会被过滤掉。
@@ -261,53 +264,42 @@ def download_filings(
         cik_clean = cik.lstrip("0")
 
         if keyword:
-            # ===== EXHIBIT MODE: 查找匹配关键词的 exhibit =====
-            html = _fetch_index_page(cik, acc)
-            if html:
-                all_docs = _parse_filing_documents(html, cik, acc)
-                pattern = re.compile(keyword, re.IGNORECASE)
-                matching = [
-                    d for d in all_docs
-                    if _is_exhibit_type(d, form_type)
-                    and pattern.search(d["description"])
-                ]
-                for exhibit in matching:
-                    safe_fname = _safe_name(
-                        f"{ticker}_{form_type}_{date_str}"
-                        f"_{exhibit['type']}_{exhibit['filename']}"
-                    )
-                    filepath = output_dir / safe_fname
+            # ===== EXHIBIT MODE: 下载所有 exhibit 文档 =====
+            all_exhibits = _fetch_filing_exhibits(cik, acc)
 
-                    if progress_callback:
-                        progress_callback(idx, total,
-                            f"{ticker} {exhibit['type']}: {exhibit['filename'][:50]}")
+            # 筛选所有 exhibit（不按关键词过滤，因为SEC描述无语义信息）
+            exhibits = [d for d in all_exhibits if d["_is_ex"]]
 
-                    if filepath.exists():
-                        downloaded.append(filepath)
-                        continue
+            for exhibit in exhibits:
+                safe_fname = _safe_name(
+                    f"{ticker}_{form_type}_{date_str}"
+                    f"_{exhibit['type']}_{exhibit['filename']}"
+                )
+                filepath = output_dir / safe_fname
 
-                    for attempt in range(MAX_RETRIES):
-                        try:
-                            resp = session.get(exhibit["url"], timeout=REQUEST_TIMEOUT)
-                            if resp.status_code == 200 and len(resp.content) > 1000:
-                                filepath.write_bytes(resp.content)
-                                downloaded.append(filepath)
-                                break
-                        except Exception:
-                            if attempt < MAX_RETRIES - 1:
-                                time.sleep(2 * (attempt + 1))
+                if progress_callback:
+                    progress_callback(idx, total,
+                        f"{ticker} {exhibit['type']}: {exhibit['filename'][:50]}")
 
-                    time.sleep(REQUEST_DELAY)
+                if filepath.exists():
+                    downloaded.append(filepath)
+                    continue
 
-                if not matching and primary_doc:
-                    # 没有匹配的exhibit，回退到主文档
-                    _download_primary(
-                        cik_clean, acc_no_dashes, primary_doc,
-                        ticker, form_type, date_str,
-                        output_dir, downloaded, idx, total, progress_callback,
-                    )
-            elif primary_doc:
-                # index page获取失败，回退
+                for attempt in range(MAX_RETRIES):
+                    try:
+                        resp = session.get(exhibit["url"], timeout=REQUEST_TIMEOUT)
+                        if resp.status_code == 200 and len(resp.content) > 1000:
+                            filepath.write_bytes(resp.content)
+                            downloaded.append(filepath)
+                            break
+                    except Exception:
+                        if attempt < MAX_RETRIES - 1:
+                            time.sleep(2 * (attempt + 1))
+
+                time.sleep(REQUEST_DELAY)
+
+            if not exhibits and primary_doc:
+                # 没有找到exhibit，回退到主文档
                 _download_primary(
                     cik_clean, acc_no_dashes, primary_doc,
                     ticker, form_type, date_str,
@@ -338,39 +330,6 @@ def download_filings(
                             f"{ticker} 6-K skipped (non-financial)")
 
     return downloaded
-
-
-def _is_exhibit_type(doc: dict, form_type: str) -> bool:
-    """判断文档是否为exhibit（非主文档），6-K的exhibit类型标签可能与8-K不同"""
-    dtype = doc["type"].upper()
-    fname = doc.get("filename", "").lower()
-
-    # 标准EX-*类型
-    if dtype.startswith("EX-"):
-        return True
-
-    # 文件名明显是exhibit
-    import re as _re
-    if _re.search(r'ex(\d+|hibit|-|_)', fname):
-        if dtype != form_type.upper():
-            return True
-
-    # 6-K的exhibit类型标签可能不同
-    if form_type.upper().startswith("6-K"):
-        # 非6-K/6-K/A类型的文档通常都是exhibit
-        if dtype and dtype not in ("6-K", "6-K/A"):
-            return True
-        # 空类型但文件名像exhibit
-        if not dtype and _re.search(r'ex(\d+|hibit|-|_)', fname):
-            return True
-
-    # 8-K的exhibit但文件名明显不同
-    if form_type.upper().startswith("8-K"):
-        if dtype and dtype not in ("8-K", "8-K/A"):
-            if _re.search(r'ex(\d+|hibit|-|_)', fname):
-                return True
-
-    return False
 
 
 def _check_financial_content(filepath: Path, filter_pattern: str) -> bool:
