@@ -201,6 +201,74 @@ def _try_ir_urls(domain: str, company_name: str, ticker: str) -> str:
     return ""
 
 
+def _scrape_ir_page(ir_url: str, ticker: str) -> list[dict]:
+    """Directly scrape the IR page for presentation PDF links.
+
+    Looks for links on the IR page that point to PDFs with presentation-related
+    link text or URLs.
+    """
+    results = []
+    try:
+        resp = _session.get(ir_url, timeout=15, allow_redirects=True)
+        if resp.status_code != 200:
+            return results
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        seen_urls = set()
+
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            text = a.get_text(strip=True)
+            url_lower = href.lower()
+            text_lower = text.lower()
+
+            # Only interested in PDFs
+            if not url_lower.endswith(".pdf"):
+                continue
+
+            # Check if presentation-related
+            pres_keywords = [
+                "presentation", "slides", "deck", "earnings",
+                "quarterly", "supplement", "investor",
+            ]
+            has_kw = any(kw in url_lower or kw in text_lower for kw in pres_keywords)
+            if not has_kw:
+                continue
+
+            # Skip SEC filings
+            if any(kw in url_lower for kw in ["10-q", "10-k", "10k", "10q", "as-filed", "exhibit"]):
+                continue
+
+            # Resolve relative URLs
+            if href.startswith("/"):
+                from urllib.parse import urljoin
+                full_url = urljoin(ir_url, href)
+            elif href.startswith("http"):
+                full_url = href
+            else:
+                full_url = urljoin(ir_url, href)
+
+            if full_url in seen_urls:
+                continue
+            seen_urls.add(full_url)
+
+            # Determine type from link text
+            is_remarks = any(kw in text_lower for kw in ["prepared remarks", "remarks", "transcript"])
+            doc_type = "transcript" if is_remarks else "presentation"
+
+            results.append({
+                "title": f"{ticker.upper()} {text}" if text else f"{ticker.upper()} Presentation",
+                "url": full_url,
+                "type": doc_type,
+                "date": "",
+            })
+
+    except Exception:
+        pass
+
+    return results
+
+
 def _search_ir_for_presentations(ir_url: str, ticker: str, company_name: str) -> list[dict]:
     """Use DuckDuckGo to search the IR site for presentation PDFs."""
     if not ir_url:
@@ -298,8 +366,13 @@ def find_presentations(ticker: str, company_name: str = "", target_dates: list[s
     # Step 2: Find the actual IR page
     ir_url = _try_ir_urls(domain, company_name, ticker)
 
-    # Step 3: Search IR site for presentations (fallback)
+    # Step 3: Directly scrape IR page for presentation PDFs
     if ir_url:
+        scrape_results = _scrape_ir_page(ir_url, ticker)
+        all_results.extend(scrape_results)
+
+    # Step 4: Search IR site for presentations (DDG fallback)
+    if ir_url and not all_results:
         search_results = _search_ir_for_presentations(ir_url, ticker, company_name)
         all_results.extend(search_results)
 
