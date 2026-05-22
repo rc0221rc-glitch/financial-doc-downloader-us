@@ -357,23 +357,56 @@ def find_presentations(ticker: str, company_name: str = "", target_dates: list[s
     domain = _extract_domain(website)
     all_results = []
 
-    # Step 1: Try Q4 Events API (most common IR platform)
+    # Step 1: Try Q4 Events API on multiple domain patterns
+    ir_domains_to_try = []
     if domain:
-        ir_domain = f"investor.{domain.replace('www.', '')}"
-        q4_results = _try_q4_events(ir_domain, ticker, target_dates or [])
-        all_results.extend(q4_results)
+        clean = domain.replace("www.", "")
+        ir_domains_to_try.append(f"investor.{clean}")
+        ir_domains_to_try.append(f"ir.{clean}")
+        ir_domains_to_try.append(f"investors.{clean}")
+        # Also try ticker-based domain (common for Q4)
+        ir_domains_to_try.append(f"investor.{ticker.lower()}.com")
+
+    # Deduplicate while preserving order
+    seen_domains = set()
+    for d in ir_domains_to_try:
+        if d not in seen_domains:
+            seen_domains.add(d)
+            q4_results = _try_q4_events(d, ticker, target_dates or [])
+            if q4_results:
+                all_results.extend(q4_results)
+                break  # Found a working Q4 endpoint
 
     # Step 2: Find the actual IR page
     ir_url = _try_ir_urls(domain, company_name, ticker)
+
+    # If no IR URL found from domain, try ticker-based patterns
+    if not ir_url:
+        extra_candidates = [
+            f"https://investor.{ticker.lower()}.com",
+            f"https://ir.{ticker.lower()}.com",
+        ]
+        for url in extra_candidates:
+            try:
+                resp = _session.get(url, timeout=15, allow_redirects=True)
+                if resp.status_code == 200:
+                    ir_url = resp.url
+                    break
+            except Exception:
+                continue
 
     # Step 3: Directly scrape IR page for presentation PDFs
     if ir_url:
         scrape_results = _scrape_ir_page(ir_url, ticker)
         all_results.extend(scrape_results)
 
-    # Step 4: Search IR site for presentations (DDG fallback)
-    if ir_url and not all_results:
+    # Step 4: DDG search (always run as additional fallback)
+    if ir_url:
         search_results = _search_ir_for_presentations(ir_url, ticker, company_name)
+        all_results.extend(search_results)
+    elif domain:
+        # Even without IR URL, try site-scoped search on the domain
+        search_results = _search_ir_for_presentations(f"https://{domain}", ticker, company_name)
         all_results.extend(search_results)
 
     # Deduplicate by URL
@@ -410,16 +443,28 @@ def download_presentations(
     downloaded = []
 
     if progress_callback:
-        progress_callback(0, 1, f"Searching IR page for {ticker} presentations...")
+        progress_callback(0, 1, f"Getting company info for {ticker}...")
 
     if not company_name:
-        company_name, _, _ = _get_company_info(ticker)
+        company_name, website, _ = _get_company_info(ticker)
+    else:
+        _, website, _ = _get_company_info(ticker)
+
+    domain = _extract_domain(website)
+    if progress_callback:
+        if domain:
+            progress_callback(0, 1, f"IR domain: {domain} — searching for presentations...")
+        else:
+            progress_callback(0, 1, f"No website from Yahoo, trying fallback search...")
 
     presentations = find_presentations(ticker, company_name, target_dates)
 
     if not presentations:
         if progress_callback:
-            progress_callback(0, 1, f"No presentations found for {ticker}")
+            msg = f"No presentations found for {ticker}"
+            if not domain:
+                msg += " (company website not available from Yahoo Finance)"
+            progress_callback(0, 1, msg)
         return downloaded
 
     total = len(presentations)

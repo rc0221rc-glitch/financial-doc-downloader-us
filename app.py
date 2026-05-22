@@ -219,10 +219,21 @@ if st.session_state.filing_df is not None and not st.session_state.filing_df.emp
             status_widget.write(f"✅ 下载完成：{len(files)}/{len(selected_df)} 份文件")
             overall_progress.progress(0.45)
 
-            # Compute filing dates from ALL queried filings (not just selected ones)
+            # Compute filing dates: SEC filings + Yahoo Finance earnings dates
             all_filing_dates = sorted(set(
                 str(d)[:10].replace("-", "") for d in df["filing_date"]
             ))
+            # Also get Yahoo Finance earnings dates (critical for non-US companies)
+            try:
+                import yfinance as yf
+                stock = yf.Ticker(ticker)
+                earnings = stock.earnings_dates
+                if earnings is not None and not earnings.empty:
+                    for dt in earnings.index:
+                        all_filing_dates.append(dt.strftime("%Y%m%d"))
+                all_filing_dates = sorted(set(all_filing_dates))
+            except Exception:
+                pass
 
             # Transcript search (based on step 2 checkbox, not step 4 selection)
             transcript_files = []
@@ -322,6 +333,106 @@ if st.session_state.filing_df is not None and not st.session_state.filing_df.emp
             st.code(traceback.format_exc())
 
         overall_progress.empty()
+
+# ---------- Non-SEC path: Transcript & Presentation search for companies without SEC filings ----------
+if (st.session_state.selected_company
+        and not (st.session_state.filing_df is not None and not st.session_state.filing_df.empty)
+        and any(dt in st.session_state.doc_types for dt in ["业绩电话会纪要", "业绩演示材料"])):
+    company = st.session_state.selected_company
+    ticker = company["ticker"]
+
+    st.header("搜索电话会纪要与演示材料")
+    st.info(f"该公司在SEC的档案有限，将直接从互联网搜索 **{ticker}** 的电话会纪要与演示材料。")
+
+    if st.button("🔍 搜索电话会纪要与演示材料", type="primary"):
+        out_root = DOWNLOAD_DIR / ticker
+        trans_dir = out_root / "Transcripts"
+        pres_dir = out_root / "Presentations"
+        trans_dir.mkdir(parents=True, exist_ok=True)
+        pres_dir.mkdir(parents=True, exist_ok=True)
+
+        st.session_state.download_excel_path = None
+        st.session_state.download_zip_path = None
+
+        status_widget = st.status("正在搜索...", expanded=True)
+        all_files = []
+
+        try:
+            # Get Yahoo Finance earnings dates
+            import yfinance as yf
+            yahoo_dates = []
+            try:
+                stock = yf.Ticker(ticker)
+                earnings = stock.earnings_dates
+                if earnings is not None and not earnings.empty:
+                    for dt in earnings.index:
+                        yahoo_dates.append(dt.strftime("%Y%m%d"))
+                yahoo_dates = sorted(set(yahoo_dates))
+                status_widget.write(f"从Yahoo Finance获取到 {len(yahoo_dates)} 个业绩日期")
+            except Exception:
+                status_widget.write("无法从Yahoo Finance获取业绩日期，将使用最近日期搜索")
+
+            if not yahoo_dates:
+                from datetime import datetime
+                today = datetime.now()
+                for i in range(12):
+                    dt = today - timedelta(days=90 * i)
+                    yahoo_dates.append(dt.strftime("%Y%m%d"))
+                yahoo_dates.sort()
+
+            # Transcript search
+            if "业绩电话会纪要" in st.session_state.doc_types:
+                status_widget.write("🎙️ 搜索业绩电话会纪要...")
+                transcript_files = download_transcripts(
+                    ticker, yahoo_dates, trans_dir,
+                    company_name=company.get("name", ""),
+                    progress_callback=lambda cur, total, msg: status_widget.write(
+                        f"🎙️ {msg}"
+                    ),
+                )
+                if transcript_files:
+                    all_files.extend(transcript_files)
+                    status_widget.write(f"🎙️ 找到 {len(transcript_files)} 份电话会纪要")
+                else:
+                    status_widget.write("🎙️ 未找到电话会纪要")
+
+            # Presentation search
+            if "业绩演示材料" in st.session_state.doc_types:
+                status_widget.write("📊 搜索业绩演示材料...")
+                pres_files = download_presentations(
+                    ticker, pres_dir,
+                    company_name=company.get("name", ""),
+                    target_dates=yahoo_dates,
+                    progress_callback=lambda cur, total, msg: status_widget.write(
+                        f"📊 {msg}"
+                    ),
+                )
+                if pres_files:
+                    all_files.extend(pres_files)
+                    status_widget.write(f"📊 找到 {len(pres_files)} 份演示材料")
+                else:
+                    status_widget.write("📊 未找到演示材料")
+
+            # Package results
+            if all_files:
+                zip_path = out_root / f"{ticker}_Transcripts_Presentations.zip"
+                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for p in all_files:
+                        zf.write(p, p.name)
+                st.session_state.download_zip_path = str(zip_path)
+                st.session_state.results = {
+                    "file_count": len(all_files),
+                    "table_count": 0,
+                    "excel_count": 0,
+                }
+
+            status_widget.update(label="✅ 搜索完成！", state="complete")
+
+        except Exception as e:
+            status_widget.update(label=f"❌ 出错", state="error")
+            st.error(f"搜索出错：{e}")
+            import traceback
+            st.code(traceback.format_exc())
 
 # ---------- 结果展示 & 下载 ----------
 if st.session_state.results:
