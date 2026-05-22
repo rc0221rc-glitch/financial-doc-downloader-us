@@ -219,18 +219,18 @@ if st.session_state.filing_df is not None and not st.session_state.filing_df.emp
             status_widget.write(f"✅ 下载完成：{len(files)}/{len(selected_df)} 份文件")
             overall_progress.progress(0.45)
 
-            # Compute filing dates for transcript/presentation search
-            filing_dates = sorted(set(
-                str(d)[:10].replace("-", "") for d in selected_df["filing_date"]
+            # Compute filing dates from ALL queried filings (not just selected ones)
+            all_filing_dates = sorted(set(
+                str(d)[:10].replace("-", "") for d in df["filing_date"]
             ))
 
-            # Transcript search
+            # Transcript search (based on step 2 checkbox, not step 4 selection)
             transcript_files = []
-            if "业绩电话会纪要" in set(selected_df["doc_type"].tolist()):
+            if "业绩电话会纪要" in st.session_state.doc_types:
                 status_widget.write("🎙️ 搜索业绩电话会纪要...")
                 trans_dir = out_root / "Transcripts"
                 transcript_files = download_transcripts(
-                    ticker, filing_dates, trans_dir,
+                    ticker, all_filing_dates, trans_dir,
                     company_name=company.get("name", ""),
                     progress_callback=lambda cur, total, msg: status_widget.write(
                         f"🎙️ {msg}"
@@ -242,14 +242,14 @@ if st.session_state.filing_df is not None and not st.session_state.filing_df.emp
                 else:
                     status_widget.write("🎙️ 未找到电话会纪要")
 
-            # Presentation search for 业绩演示材料
-            if "业绩演示材料" in set(selected_df["doc_type"].tolist()):
+            # Presentation search (based on step 2 checkbox, not step 4 selection)
+            if "业绩演示材料" in st.session_state.doc_types:
                 status_widget.write("📊 搜索业绩演示材料...")
                 pres_dir = out_root / "Presentations"
                 pres_files = download_presentations(
                     ticker, pres_dir,
                     company_name=company.get("name", ""),
-                    target_dates=filing_dates,
+                    target_dates=all_filing_dates,
                     progress_callback=lambda cur, total, msg: status_widget.write(
                         f"📊 {msg}"
                     ),
